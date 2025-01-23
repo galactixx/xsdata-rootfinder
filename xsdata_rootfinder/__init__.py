@@ -4,21 +4,24 @@ from os import PathLike
 import os
 from collections import deque
 from collections.abc import Collection
+from abc import ABC, abstractmethod
 from pathlib import Path
 from dataclasses import dataclass, field
 from concurrent.futures import as_completed, Future, ThreadPoolExecutor
 from typing import (
-    Callable,
+    cast,
+    ClassVar,
     Deque,
     Dict,
     List,
     Literal,
     Optional,
     Set,
+    Tuple,
+    Type,
     TypeAlias,
     Union
 )
-
 import libcst as cst
 from libcst.metadata import CodeRange, MetadataWrapper, PositionProvider
 from pathvalidate import validate_filepath, ValidationError
@@ -34,37 +37,65 @@ GenModels: TypeAlias = Literal[
 # Constants and global variables
 _MAX_RETRIES = 3
 
-def _is_dataclass_model(node: cst.ClassDef) -> bool:
-    """
-    Private function to determine if a `libcst.ClassDef` object is a
-    dataclass.
-    """
-    return (
-        _parse_imported_module(decorator.decorator).value == "dataclass"
-        for decorator in node.decorators
-    )
+class _AbstractModelCheck(ABC):
+    """"""
+    __model_module__: ClassVar[str]
+
+    def __init__(self, imports: Imports) -> None:
+        self.imports = imports
+
+    @abstractmethod
+    def run_model_check(self, node: cst.ClassDef) -> bool:
+        """"""
+        pass
+
+    def _parse_imported_module(self, expression: cst.BaseExpression) -> bool:
+        """"""
+        module = _parse_imported_module(expression)
+        found_module = self.imports.find_common_import(module)
+        is_imported = False
+
+        if found_module is not None:
+            module_from_file = self.imports.get_import(found_module)
+            is_imported = module_from_file.module == self.__model_module__
+
+        if self.imports.import_stars:
+            pass
+
+        return is_imported
 
 
-def _is_pydantic_model(node: cst.ClassDef) -> bool:
-    """
-    Private function to determine if a `libcst.ClassDef` object is a
-    `pydantic.BaseModel`.
-    """
-    return any(
-        _parse_imported_module(base_class.value).value == 'BaseModel'
-        for base_class in node.bases
-    )
+class _DataclassModelCheck(_AbstractModelCheck):
+    __model_module__: ClassVar[str] = 'dataclasses.dataclass'
+
+    def run_model_check(self, node: cst.ClassDef) -> bool:
+        """"""
+        return any(
+            self._parse_imported_module(decorator.decorator)
+            for decorator in node.decorators
+        )
+    
+
+class _PydanticModelCheck(_AbstractModelCheck):
+    __model_module__: ClassVar[str] = 'pydantic.BaseModel'
+
+    def run_model_check(self, node: cst.ClassDef) -> bool:
+        """"""
+        return any(
+            self._parse_imported_module(base_class.value)
+            for base_class in node.bases
+        )
 
 
-def _is_attrs_model(node: cst.ClassDef) -> bool:
-    """
-    Private function to determine if a `libcst.ClassDef` object is a
-    `attrs.s`.
-    """
-    return any(
-        _parse_imported_module(decorator.decorator).module == 'attrs.s'
-        for decorator in node.decorators
-    )
+class _AttrsModelCheck(_AbstractModelCheck):
+    __model_module__: ClassVar[str] = 'attr.s'
+
+    def run_model_check(self, node: cst.ClassDef) -> bool:
+        """"""
+        return any(
+            self._parse_imported_module(decorator.decorator)
+            for decorator in node.decorators
+        )
 
 
 def _parse_imported_module(module: _ModuleType) -> _ImportIdentifier:
@@ -76,10 +107,9 @@ def _parse_imported_module(module: _ModuleType) -> _ImportIdentifier:
         if isinstance(cur_module_level, cst.Name):
             module_levels.append(cur_module_level.value)
         else:
-            module_objects.extend(
+            module_objects.extendleft(
                 [cur_module_level.attr, cur_module_level.value]
             )
-
     return _ImportIdentifier.from_levels(module_levels)
 
 
@@ -98,6 +128,23 @@ def _root_finder(defs: Set[RootModel], refs: Set[str]) -> Optional[List[RootMode
 def _create_module_from_levels(levels: List[str]) -> str:
     """Combine module levels into a single dotted module path."""
     return '.'.join(levels)
+
+
+def _decompose_module(module: str) -> List[str]:
+    """"""
+    return module.split('.')
+
+
+def _parse_import_alias(import_alias: cst.ImportAlias) -> Tuple[str, _ImportIdentifier]:
+    """"""
+    if import_alias.asname is not None:
+        alias = cast(cst.Name, import_alias.asname.name)
+    else:
+        alias = import_alias.name
+
+    alias = _parse_imported_module(alias).module
+    module = _parse_imported_module(import_alias.name)
+    return alias, module
 
 
 def _find_all_types_in_subscript(subscript: cst.Subscript, module: Optional[str]) -> Set[str]:
@@ -184,13 +231,40 @@ class _XSDataCollectedClasses:
         self._consoildate_classes(visitor)
 
     def visit_and_consolidate_by_path(self, source: PathLike) -> None:
-        """Process and consolidate data from a source file specified as a PathLike object."""
-        print(source)
+        """Process and consolidate data from a source file as a PathLike object."""
         if not isinstance(source, PathLike):
             raise TypeError("'source' argument must be a PathLike object")
 
         self.visit_and_consolidate(source)
     
+
+@dataclass
+class Imports:
+    """"""
+    imports: Dict[str, _ImportIdentifier] = field(default_factory=dict)
+    import_stars: Set[_ImportIdentifier] = field(default_factory=set)
+
+    def find_common_import(self, module: _ImportIdentifier) -> Optional[str]:
+        """"""
+        module_parts = module.parts
+        for idx in range(len(module_parts), 0, -1):
+            str_module = _create_module_from_levels(module_parts[:idx])
+            if str_module in self.imports:
+                return str_module
+        return None
+    
+    def get_import(self, module: str) -> _ImportIdentifier:
+        """"""
+        return self.imports[module]
+                   
+    def add_import_star(self, module: _ImportIdentifier) -> None:
+        """"""
+        self.import_stars.add(module)
+
+    def add_import(self, alias: str, module: _ImportIdentifier) -> None:
+        """"""
+        self.imports[alias] = module
+
 
 @dataclass(frozen=True)
 class _ImportIdentifier:
@@ -199,11 +273,16 @@ class _ImportIdentifier:
     attribute: Optional[str] = None
 
     @property
+    def parts(self) -> List[str]:
+        """"""
+        return _decompose_module(self.module)
+
+    @property
     def module(self) -> str:
         """"""
         return (
             self.value if self.attribute is None
-            else self.attribute + self.value
+            else f'{self.attribute}.{self.value}'
         )
 
     @classmethod
@@ -235,7 +314,7 @@ class RootModel:
         )
 
     @classmethod
-    def from_cst_class(
+    def _from_cst_class(
         cls, span: CodeRange, node: cst.ClassDef, module: Optional[str]
     ) -> RootModel:
         """Create a `RootModel` instance from a `cst.ClassDef` and its metadata."""
@@ -262,6 +341,7 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
     def __init__(self, gen_model: GenModels, module: Optional[str]) -> None:
         self.gen_model = gen_model
         self.module = module
+        self.imports = Imports()
         self.class_trace: Deque[cst.ClassDef] = deque([])
         self.ref_classes: Set[str] = set()
         self.defined_classes: Set[RootModel] = set()
@@ -271,21 +351,24 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         A private function that determines if a given `libcst.ClassDef`
         object is a class that was generated by `xsdata`.
         """
-        MODELS_CHECKS: Dict[GenModels, Callable[[cst.ClassDef]], bool] = {
-            'dataclass': _is_dataclass_model,
-            'pydantic': _is_pydantic_model,
-            'attrs': _is_attrs_model
+        MODELS_CHECKS: Dict[GenModels, Type[_AbstractModelCheck]] = {
+            'dataclass': _DataclassModelCheck,
+            'pydantic': _PydanticModelCheck,
+            'attrs': _AttrsModelCheck
         }
 
-        model_func = MODELS_CHECKS.get(self.gen_model)
-        if model_func is None:
+        ModelCheck = MODELS_CHECKS.get(self.gen_model)
+        if ModelCheck is None:
             raise ValueError(
                 "'gen_model' must be one of ('dataclass', 'pydantic', 'attrs')"
             )
+        
+        model_check = ModelCheck(self.imports)
 
         class_node = self.class_trace.popleft()
         self.class_trace.appendleft(class_node)
-        return model_func(class_node)
+        is_valid_model = model_check.run_model_check(class_node)
+        return is_valid_model
     
     def _add_class_to_ref(self, name: str) -> None:
         """"""
@@ -304,19 +387,39 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
 
     def _subscript_ann_assign(self, node: cst.Subscript) -> None:
         """Handle annotations that are subscripted types (e.g., List[int])."""
-        classes_found = _find_all_types_in_subscript(node, self.module)
-        self.ref_classes.update(classes_found)
+        classes_names = _find_all_types_in_subscript(node, self.module)
+        self.ref_classes.update(classes_names)
 
     def _simple_string_ann_assign(self, node: cst.SimpleString) -> None:
         """Handle annotations represented as simple strings (e.g., "MyClass")."""
         class_name = node.value.strip('"')
         self._add_class_to_ref(class_name)
 
+    def visit_Import(self, node: cst.Import) -> None:
+        """"""
+        for import_alias in node.names:
+            alias, module = _parse_import_alias(import_alias)
+            self.imports.add_import(alias, module)
+    
+    def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
+        """"""
+        module = _parse_imported_module(node.module)
+        if isinstance(node.names, cst.ImportStar):
+            self.imports.add_import_star(module)
+            return None
+        
+        for import_alias in node.names:
+            alias, non_alias = _parse_import_alias(import_alias)
+            combined_module = _ImportIdentifier.from_levels(
+                module.parts + non_alias.parts
+            )
+            self.imports.add_import(alias, combined_module)
+
     def visit_ClassDef(self, node: cst.ClassDef) -> None:
         """Set the currently visited class definition."""
         if not self.class_trace:
             span = self.get_metadata(PositionProvider, node)
-            root_model = RootModel.from_cst_class(span, node, self.module)
+            root_model = RootModel._from_cst_class(span, node, self.module)
             self.defined_classes.add(root_model)
         
         self.class_trace.appendleft(node)
