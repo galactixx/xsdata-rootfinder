@@ -31,7 +31,7 @@ from pathvalidate import validate_filepath, ValidationError
 # Typealiases
 _ModuleType: TypeAlias = Union[cst.Name, cst.Attribute]
 
-PythonSource: TypeAlias = Union[str, Path]
+PythonSource: TypeAlias = Union[str, PathLike[str]]
 XsdModels: TypeAlias = Literal[
     'dataclass', 'pydantic', 'attrs'
 ]
@@ -53,7 +53,7 @@ class _AbstractModelCheck(ABC):
 
     def _parse_imported_module(self, expression: cst.BaseExpression) -> bool:
         """Check if the imported module matches the expected model module."""
-        module = _parse_imported_module(expression)
+        module = _parse_imported_module(cast(_ModuleType, expression))
         found_module = self.imports.find_common_import(module)
         is_imported = False
 
@@ -68,7 +68,6 @@ class _AbstractModelCheck(ABC):
                 self.__model_module__
             )
             is_imported = import_remaining in self.imports.import_stars
-
         return is_imported
 
 
@@ -117,9 +116,9 @@ def _parse_imported_module(module: _ModuleType) -> _ImportIdentifier:
         if isinstance(cur_module_level, cst.Name):
             module_levels.append(cur_module_level.value)
         else:
-            module_objects.extendleft(
-                [cur_module_level.attr, cur_module_level.value]
-            )
+            cur_module_attr = cur_module_level.attr
+            cur_module_value = cast(_ModuleType, cur_module_level.value)
+            module_objects.extendleft([cur_module_attr, cur_module_value])
     return _ImportIdentifier.from_levels(module_levels)
 
 
@@ -147,6 +146,7 @@ def _decompose_module(module: str) -> List[str]:
 
 def _parse_import_alias(import_alias: cst.ImportAlias) -> Tuple[str, _ImportIdentifier]:
     """Parse an import alias into its alias and module components."""
+    alias: _ModuleType
     if import_alias.asname is not None:
         alias = cast(cst.Name, import_alias.asname.name)
     else:
@@ -165,11 +165,12 @@ def _find_all_types_in_subscript(subscript: cst.Subscript, module: Optional[str]
     """
     classes_found: Set[str] = set()
 
-    def add_module(name: str) -> str:
+    def add_module(name: str) -> None:
         res = name if module is None else module + name
         classes_found.add(res)
 
-    def traversal(slice_index: cst.Index) -> None:
+    def traversal(base_slice: cst.BaseSlice) -> None:
+        slice_index = cast(cst.Index, base_slice)
         slice_index_value = slice_index.value
 
         # If the value of the index is a cst.Subscript, then
@@ -221,7 +222,7 @@ class _XSDataCollectedClasses:
     """
     xsd_models: XsdModels
     refs: Set[str] = field(default_factory=set)
-    defs: Set[str] = field(default_factory=set)
+    defs: Set[RootModel] = field(default_factory=set)
     
     def _consoildate_classes(self, visitor: _XSDataRootFinderVisitor) -> None:
         """
@@ -240,7 +241,7 @@ class _XSDataCollectedClasses:
         visitor =  _python_source_visit(source, self.xsd_models)
         self._consoildate_classes(visitor)
 
-    def visit_and_consolidate_by_path(self, source: PathLike) -> None:
+    def visit_and_consolidate_by_path(self, source: PathLike[str]) -> None:
         """Process and consolidate data from a source file as a PathLike object."""
         if not isinstance(source, PathLike):
             raise TypeError("'source' argument must be a PathLike object")
@@ -262,7 +263,7 @@ class Imports:
             if str_module in self.imports:
                 return str_module
         return None
-    
+
     def get_import(self, module: str) -> _ImportIdentifier:
         """Retrieve the `_ImportIdentifier` for the specified module."""
         return self.imports[module]
@@ -413,6 +414,9 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
     
     def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
         """Parse and consolidate any import-from statements found."""
+        if node.module is None:
+            return None
+        
         module = _parse_imported_module(node.module)
         if isinstance(node.names, cst.ImportStar):
             self.imports.add_import_star(module)
@@ -481,19 +485,18 @@ def _read_python_file(source: PythonSource) -> str:
     if os.path.isfile(source):
         with open(source, "r") as py_file:
             python_file = py_file.read()
-
         return python_file
 
     try:
         py_source_as_path = Path(source)
         validate_filepath(file_path=py_source_as_path)
     except ValidationError:
-        pass
+        res_source = str(source)
     else:
         raise FileNotFoundError(
             "If path is passed in as the source, it must link to an existing file"
         )
-    return source
+    return res_source
 
 
 def _python_source_visit(source: PythonSource, xsd_models: XsdModels) -> _XSDataRootFinderVisitor:
@@ -513,7 +516,7 @@ def root_finder(source: PythonSource, xsd_models: XsdModels = 'dataclass') -> Op
 
 
 def root_finders(
-    sources: Collection[PathLike],
+    sources: Collection[PathLike[str]],
     xsd_models: XsdModels = 'dataclass',
     multiprocessing: MultiprocessingSettings = MultiprocessingSettings()
 ) -> Optional[List[RootModel]]:
@@ -521,7 +524,7 @@ def root_finders(
     consolidated_classes = _XSDataCollectedClasses(xsd_models)
     if multiprocessing.enabled:
         with ThreadPoolExecutor(multiprocessing.max_workers) as thread_executor:
-            futures: Dict[Future, str] = {
+            futures = {
                 thread_executor.submit(
                     consolidated_classes.visit_and_consolidate_by_path, source
                 ): source
@@ -540,7 +543,7 @@ def root_finders(
                             raise TimeoutError(e)
                     except Exception as e:
                         raise XSDataRootFinderError(
-                            "Task was not completed succesfully", fut_source
+                            "Task was not completed succesfully", Path(fut_source)
                         ) from e
     else:
         for source in sources:
