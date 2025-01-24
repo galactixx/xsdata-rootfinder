@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from os import PathLike
-import os
 import re
 from collections import deque
 from collections.abc import Collection
 from abc import ABC, abstractmethod
 from pathlib import Path
 from dataclasses import dataclass, field
-from concurrent.futures import as_completed, Future, ThreadPoolExecutor
+from concurrent.futures import as_completed, ThreadPoolExecutor
 from typing import (
     cast,
     ClassVar,
@@ -31,7 +30,8 @@ from pathvalidate import validate_filepath, ValidationError
 # Typealiases
 _ModuleType: TypeAlias = Union[cst.Name, cst.Attribute]
 
-PythonSource: TypeAlias = Union[str, PathLike[str]]
+StrOrPath: TypeAlias = Union[str, PathLike[str]]
+CodeOrStrOrPath: TypeAlias = Union[str, PathLike[str]]
 XsdModels: TypeAlias = Literal[
     'dataclass', 'pydantic', 'attrs'
 ]
@@ -40,15 +40,18 @@ XsdModels: TypeAlias = Literal[
 _MAX_RETRIES = 3
 
 class _AbstractModelCheck(ABC):
-    """Abstract base class for running model checks on CST class definitions."""
+    """
+    An abstract base class for running model checks on `libcst.ClassDef`
+    objects.
+    """
     __model_module__: ClassVar[str]
 
-    def __init__(self, imports: Imports) -> None:
+    def __init__(self, imports: _Imports) -> None:
         self.imports = imports
 
     @abstractmethod
     def run_model_check(self, node: cst.ClassDef) -> bool:
-        """Run the model check for a CST class definition."""
+        """Run the model check for a `libcst.ClassDef` object."""
         pass
 
     def _parse_imported_module(self, expression: cst.BaseExpression) -> bool:
@@ -72,7 +75,7 @@ class _AbstractModelCheck(ABC):
 
 
 class _DataclassModelCheck(_AbstractModelCheck):
-    """Model check implementation for dataclass decorators."""
+    """A class that checks implementation for dataclass decorators."""
     __model_module__: ClassVar[str] = 'dataclasses.dataclass'
 
     def run_model_check(self, node: cst.ClassDef) -> bool:
@@ -84,7 +87,7 @@ class _DataclassModelCheck(_AbstractModelCheck):
     
 
 class _PydanticModelCheck(_AbstractModelCheck):
-    """Model check implementation for Pydantic BaseModel inheritance."""
+    """A class that checks implementation for Pydantic BaseModel inheritance."""
     __model_module__: ClassVar[str] = 'pydantic.BaseModel'
 
     def run_model_check(self, node: cst.ClassDef) -> bool:
@@ -96,7 +99,7 @@ class _PydanticModelCheck(_AbstractModelCheck):
 
 
 class _AttrsModelCheck(_AbstractModelCheck):
-    """Model check implementation for attrs decorators."""
+    """A class that checks implementation for attrs decorators."""
     __model_module__: ClassVar[str] = 'attr.s'
 
     def run_model_check(self, node: cst.ClassDef) -> bool:
@@ -105,10 +108,13 @@ class _AttrsModelCheck(_AbstractModelCheck):
             self._parse_imported_module(decorator.decorator)
             for decorator in node.decorators
         )
-
+    
 
 def _parse_imported_module(module: _ModuleType) -> _ImportIdentifier:
-    """Parse a module node to extract its full module path as an `_ImportIdentifier`."""
+    """
+    Parses a module node to extract its full module path as an
+    `_ImportIdentifier`.
+    """
     module_levels: List[str] = list()
     module_objects: Deque[_ModuleType] = deque([module])
     while module_objects:
@@ -122,30 +128,31 @@ def _parse_imported_module(module: _ModuleType) -> _ImportIdentifier:
     return _ImportIdentifier.from_levels(module_levels)
 
 
-def _root_finder(defs: Set[RootModel], refs: Set[str]) -> Optional[List[RootModel]]:
+def _root_finder(defs: Set[RootModel], refs: Set[_ReferencedClass]) -> Optional[List[RootModel]]:
     """
-    A private function to identify and return root models from one
-    or multiple Python source files.
+    Identify and return root models from one or multiple Python source
+    files.
     """
     root_classes = [
         root_model for root_model in defs
-        if root_model.full_module not in refs
+        if root_model._referenced_class not in refs
     ]
     return None if not root_classes else root_classes
 
 
 def _create_module_from_levels(levels: List[str]) -> str:
-    """Combine module levels into a single dotted module path."""
+    """Combines module levels into a single dotted module path."""
     return '.'.join(levels)
 
 
 def _decompose_module(module: str) -> List[str]:
-    """Split a module path into its individual components."""
+    """Splits a module path into its individual components."""
     return module.split('.')
 
 
 def _parse_import_alias(import_alias: cst.ImportAlias) -> Tuple[str, _ImportIdentifier]:
-    """Parse an import alias into its alias and module components."""
+    """Parses an import alias into its alias and module components.
+    """
     alias: _ModuleType
     if import_alias.asname is not None:
         alias = cast(cst.Name, import_alias.asname.name)
@@ -157,16 +164,16 @@ def _parse_import_alias(import_alias: cst.ImportAlias) -> Tuple[str, _ImportIden
     return alias, module
 
 
-def _find_all_types_in_subscript(subscript: cst.Subscript, module: Optional[str]) -> Set[str]:
+def _find_all_types_in_subscript(subscript: cst.Subscript, path: Optional[Path]) -> Set[_ReferencedClass]:
     """
-    A private function that returns a set of class names found
-    within a `libcst.Subscript` object. Traverses recursively through
-    the entire object to find all references to classes.
+    Returns a set of class names found within a `libcst.Subscript` object.
+    Traverses recursively through the entire object to find all references
+    to classes.
     """
-    classes_found: Set[str] = set()
+    classes_found: Set[_ReferencedClass] = set()
 
     def add_module(name: str) -> None:
-        res = name if module is None else module + name
+        res = _ReferencedClass(path, name)
         classes_found.add(res)
 
     def traversal(base_slice: cst.BaseSlice) -> None:
@@ -202,7 +209,19 @@ def _find_all_types_in_subscript(subscript: cst.Subscript, module: Optional[str]
 
 
 class XSDataRootFinderError(Exception):
-    """Custom exception for errors in the XSData root-finding process."""
+    """
+    Custom exception for errors encountered during the XSData root-finding
+    process.
+
+    This exception is raised when the process of identifying root models in
+    Python source files fails due to issues such as file processing errors,
+    timeouts, or unexpected conditions.
+
+    Attributes:
+        message (str): A detailed message describing the error.
+        source (Path): The file path associated with the error, providing
+            context about where the error occurred.
+    """
     def __init__(self, message: str, source: Path) -> None:
         self.message = message
         self.source = source
@@ -216,12 +235,9 @@ class XSDataRootFinderError(Exception):
 
 @dataclass
 class _XSDataCollectedClasses:
-    """
-    A private data structure to track and consolidate defined and referenced
-    classes.
-    """
+    """Tracks and consolidate defined and referenced classes."""
     xsd_models: XsdModels
-    refs: Set[str] = field(default_factory=set)
+    refs: Set[_ReferencedClass] = field(default_factory=set)
     defs: Set[RootModel] = field(default_factory=set)
     
     def _consoildate_classes(self, visitor: _XSDataRootFinderVisitor) -> None:
@@ -236,22 +252,27 @@ class _XSDataCollectedClasses:
         """Identify and return root models from one or more Python source files."""
         return _root_finder(defs=self.defs, refs=self.refs)
     
-    def visit_and_consolidate(self, source: PythonSource) -> None:
+    def visit_and_consolidate(self, source: CodeOrStrOrPath) -> None:
         """Process and consolidate data from a source file, either a str or Path."""
         visitor =  _python_source_visit(source, self.xsd_models)
         self._consoildate_classes(visitor)
 
-    def visit_and_consolidate_by_path(self, source: PathLike[str]) -> None:
-        """Process and consolidate data from a source file as a PathLike object."""
-        if not isinstance(source, PathLike):
-            raise TypeError("'source' argument must be a PathLike object")
+    def visit_and_consolidate_by_path(self, source: StrOrPath) -> None:
+        """Process and consolidate data from a source file as a `StrOrPath` object."""
+        if not Path(source).is_file():
+            raise FileNotFoundError(
+                "every object in 'source' argument must must link to an existing file"
+            )
 
         self.visit_and_consolidate(source)
     
 
 @dataclass
-class Imports:
-    """Manage and query imported modules found when parsing python source code."""
+class _Imports:
+    """
+    Manages and queries imported modules found when parsing python
+    source code.
+    """
     imports: Dict[str, _ImportIdentifier] = field(default_factory=dict)
     import_stars: Set[str] = field(default_factory=set)
 
@@ -273,24 +294,27 @@ class Imports:
         self.import_stars.add(module.module)
 
     def add_import(self, alias: str, module: _ImportIdentifier) -> None:
-        """Add an import with an alias."""
+        """Add an import to store based on the alias."""
         self.imports[alias] = module
 
 
 @dataclass(frozen=True)
 class _ImportIdentifier:
-    """Represents a module-level import identifier with optional attributes."""
+    """
+    A class that represents a module-level import identifier with
+    optional attributes.
+    """
     value: str
     attribute: Optional[str] = None
 
     @property
     def parts(self) -> List[str]:
-        """Return the module path as a list of components."""
+        """Returns the module path as a list of components."""
         return _decompose_module(self.module)
 
     @property
     def module(self) -> str:
-        """Return the full module path as a string."""
+        """Returns the full module path as a string."""
         return (
             self.value if self.attribute is None
             else f'{self.attribute}.{self.value}'
@@ -310,57 +334,98 @@ class _ImportIdentifier:
 
 @dataclass(frozen=True)
 class RootModel:
-    """Represents the root model for an unreferenced class in a module."""
-    module: Optional[str]
+    """
+    Represents the root model for an unreferenced class in a module.
+
+    A root model is a class definition that exists in a Python source file
+    but is not referenced within the same file. This class captures metadata
+    about such classes, including their name, location within the file, and
+    the file's path.
+
+    Attributes:
+        path (Optional[Path]): The file path where the class is defined. Can
+            be `None` if the source is not associated with a file
+            (e.g., in-memory code).
+        name (str): The name of the class.
+        start_line_no (int): The starting line number of the class definition
+            in the file.
+        end_line_no (int): The ending line number of the class definition in
+            the file.
+    """
+    path: Optional[Path]
     name: str
     start_line_no: int
     end_line_no: int
 
     @property
-    def full_module(self) -> str:
-        """Return the full module path of the root model, including its name."""
-        return (
-            self.name
-            if self.module is None else self.module + self.name
-        )
+    def _referenced_class(self) -> _ReferencedClass:
+        """
+        Returns a `_ReferencedClass` object representing this root model.
+        """
+        return _ReferencedClass(self.path, self.name)
 
     @classmethod
     def _from_cst_class(
-        cls, span: CodeRange, node: cst.ClassDef, module: Optional[str]
+        cls, span: CodeRange, node: cst.ClassDef, path: Optional[Path]
     ) -> RootModel:
-        """Create a `RootModel` instance from a `cst.ClassDef` and its metadata."""
+        """
+        Creates a `RootModel` instance from a `libcst.ClassDef` object
+        and its metadata.
+        """
         class_name = node.name.value
         start_line = span.start.line
         end_line = span.end.line
-        return cls(
-            module, class_name, start_line, end_line
-        )
+        return cls(path, class_name, start_line, end_line)
+
+
+@dataclass(frozen=True)
+class _ReferencedClass:
+    """A dataclass used to uniquely identify referenced classes."""
+    path: Optional[Path]
+    name: str
 
 
 @dataclass(frozen=True)
 class MultiprocessingSettings:
-    """Settings for enabling and configuring multiprocessing."""
+    """
+    Settings for enabling and configuring multiprocessing.
+
+    This class encapsulates the configuration for running tasks in parallel
+    using multiprocessing. It allows enabling or disabling multiprocessing,
+    setting the number of worker threads, and defining a timeout for each task.
+
+    Attributes:
+        enabled (bool): Whether multiprocessing is enabled. Default is `False`.
+        max_workers (int | None): The maximum number of workers (threads)
+            to use for multiprocessing. If `None`, the default thread pool size
+            is used.
+        timeout (int | None): The timeout (in seconds) for each task. If `None`,
+            no timeout is applied.
+    """
     enabled: bool = False
     max_workers: Optional[int] = None
     timeout: Optional[int] = None
 
 
 class _XSDataRootFinderVisitor(cst.CSTVisitor):
+    """
+    A visitor class to parse and extract class references from Python
+    source files.
+    """
     METADATA_DEPENDENCIES = (PositionProvider,)
 
-    """Visitor class to parse and extract class references from Python source."""
-    def __init__(self, xsd_models: XsdModels, module: Optional[str]) -> None:
+    def __init__(self, xsd_models: XsdModels, path: Optional[Path]) -> None:
         self.xsd_models = xsd_models
-        self.module = module
-        self.imports = Imports()
+        self.path = path
+        self.imports = _Imports()
         self.class_trace: Deque[cst.ClassDef] = deque([])
-        self.ref_classes: Set[str] = set()
+        self.ref_classes: Set[_ReferencedClass] = set()
         self.defined_classes: Set[RootModel] = set()
 
     def _is_relevant_model(self) -> bool:
         """
-        A private function that determines if a given `libcst.ClassDef`
-        object is a class that was generated by `xsdata`.
+        Determines if a given `libcst.ClassDef` object is a class that was
+        generated by `xsdata`.
         """
         MODELS_CHECKS: Dict[XsdModels, Type[_AbstractModelCheck]] = {
             'dataclass': _DataclassModelCheck,
@@ -380,40 +445,44 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         self.class_trace.appendleft(class_node)
         is_valid_model = model_check.run_model_check(class_node)
         return is_valid_model
-    
-    def _add_class_to_ref(self, name: str) -> None:
-        """Add a class name to the reference set."""
-        module = name if self.module is None else self.module + name
-        self.ref_classes.add(module)
+
+    def _add_class_to_refs(self, name: str) -> None:
+        """
+        Adds a `_ReferencedClass` object representing a class name to the
+        reference set.
+        """
+        ref_class = _ReferencedClass(self.path, name)
+        self.ref_classes.add(ref_class)
 
     def _attribute_ann_assign(self, node: cst.Attribute) -> None:
-        """Handle annotations that are qualified names (e.g., module.Class)."""
+        """Handles annotations that are qualified names (e.g., module.Class).
+        """
         class_name = node.attr.value
-        self._add_class_to_ref(class_name)
+        self._add_class_to_refs(class_name)
 
     def _name_ann_assign(self, node: cst.Name) -> None:
-        """Handle annotations that are simple names (e.g., int, MyClass)."""
+        """Handles annotations that are simple names (e.g., int, MyClass)."""
         class_name = node.value
-        self._add_class_to_ref(class_name)
+        self._add_class_to_refs(class_name)
 
     def _subscript_ann_assign(self, node: cst.Subscript) -> None:
-        """Handle annotations that are subscripted types (e.g., List[int])."""
-        classes_names = _find_all_types_in_subscript(node, self.module)
-        self.ref_classes.update(classes_names)
+        """Handles annotations that are subscripted types (e.g., List[int])."""
+        ref_classes = _find_all_types_in_subscript(node, self.path)
+        self.ref_classes.update(ref_classes)
 
     def _simple_string_ann_assign(self, node: cst.SimpleString) -> None:
-        """Handle annotations represented as simple strings (e.g., "MyClass")."""
+        """Handles annotations represented as simple strings (e.g., "MyClass")."""
         class_name = node.value.strip('"')
-        self._add_class_to_ref(class_name)
+        self._add_class_to_refs(class_name)
 
     def visit_Import(self, node: cst.Import) -> None:
-        """Parse and consolidate any import statements found."""
+        """Parses and consolidates any import statements found."""
         for import_alias in node.names:
             alias, module = _parse_import_alias(import_alias)
             self.imports.add_import(alias, module)
     
     def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
-        """Parse and consolidate any import-from statements found."""
+        """Parses and consolidates any import-from statements found."""
         if node.module is None:
             return None
         
@@ -430,16 +499,19 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
             self.imports.add_import(alias, combined_module)
 
     def visit_ClassDef(self, node: cst.ClassDef) -> None:
-        """Set the currently visited class definition."""
+        """
+        Set the currently visited `libcst.ClassDef` object and updates the
+        defined class store.
+        """
         if not self.class_trace:
             span = self.get_metadata(PositionProvider, node)
-            root_model = RootModel._from_cst_class(span, node, self.module)
+            root_model = RootModel._from_cst_class(span, node, self.path)
             self.defined_classes.add(root_model)
         
         self.class_trace.appendleft(node)
     
     def leave_ClassDef(self, _: cst.ClassDef) -> None:
-        """Clear the currently visited class definition."""
+        """Clear the currently visited `libcst.ClassDef` object."""
         _ = self.class_trace.popleft()
 
     def visit_AnnAssign(self, node: cst.AnnAssign) -> None:
@@ -477,12 +549,12 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         return _root_finder(defs=self.defined_classes, refs=self.ref_classes)
 
 
-def _read_python_file(source: PythonSource) -> str:
+def _read_python_file(source: CodeOrStrOrPath) -> str:
     """
-    A private function to read and return the content of a Python file or
-    validate input as a source.
+    Reads and returns the content of a Python file or validate input
+    as a source.
     """
-    if os.path.isfile(source):
+    if Path(source).is_file():
         with open(source, "r") as py_file:
             python_file = py_file.read()
         return python_file
@@ -499,36 +571,96 @@ def _read_python_file(source: PythonSource) -> str:
     return res_source
 
 
-def _python_source_visit(source: PythonSource, xsd_models: XsdModels) -> _XSDataRootFinderVisitor:
-    """Parse a Python source file and extract class definitions and references."""
+def _python_source_visit(source: CodeOrStrOrPath, xsd_models: XsdModels) -> _XSDataRootFinderVisitor:
+    """
+    Parses a Python source file and extracts class definitions and references.
+    """
+    source_path = None if not Path(source).is_file() else Path(source)
     source = _read_python_file(source)
     python_module = MetadataWrapper(cst.parse_module(source))
-    module_name = None if not os.path.isfile(source) else Path(source).stem
-    visitor = _XSDataRootFinderVisitor(xsd_models, module_name)
+    visitor = _XSDataRootFinderVisitor(xsd_models, source_path)
     python_module.visit(visitor)
     return visitor
 
 
-def root_finder(source: PythonSource, xsd_models: XsdModels = 'dataclass') -> Optional[List[RootModel]]:
-    """Identify and return root models from a single Python source file."""
+def root_finder(source: CodeOrStrOrPath, xsd_models: XsdModels = 'dataclass') -> Optional[List[RootModel]]:
+    """
+    Identify and return root models from a single Python source file.
+
+    A root model is a class that is defined in the given Python file but is
+    not referenced within that file. This function analyzes a single Python
+    source file and extracts all such unreferenced classes that match the
+    specified model type (e.g., dataclass, Pydantic, or attrs).
+
+    Args:
+        source (`CodeOrStrOrPath`): The Python source to analyze. This can be
+            a string representing the code content or path, or a path-like object
+            pointing to a Python file.
+        xsd_models (`XsdModels`): Specifies the type of models to look for.
+            Can be one of `'dataclass'` (default), `'pydantic'`, or `'attrs'`.
+
+    Returns:
+        Optional[List[`RootModel`]]: A list of `RootModel` instances representing
+            unreferenced class definitions in the file, or `None` if no root
+            models are found.
+    """
     visitor = _python_source_visit(source, xsd_models)
     return visitor.root_finder()
 
 
 def root_finders(
-    sources: Collection[PathLike[str]],
+    source: Union[StrOrPath, Collection[StrOrPath]],
     xsd_models: XsdModels = 'dataclass',
+    directory_walk: bool = False,
     multiprocessing: MultiprocessingSettings = MultiprocessingSettings()
 ) -> Optional[List[RootModel]]:
-    """Identify and return root models from multiple Python source files."""
+    """
+    Identify and return root models from multiple Python source files.
+
+    A root model is a class that is defined in the given Python file but is
+    not referenced within that file. This function analyzes one or more Python
+    source files or directories and extracts all unreferenced classes that
+    match the specified model type (e.g., dataclass, Pydantic, or attrs). It
+    supports optional multiprocessing for parallel processing of files.
+
+    Args:
+        source (`StrOrPath` | Collection[`StrOrPath`]): The source(s) to
+            analyze. This can be a single path-like object (file or directory),
+            a collection of path-like objects representing multiple files. If a
+            directory is provided, its Python files will be included for analysis.
+        xsd_models (`XsdModels`): Specifies the type of models to look for. Can
+            be one of `'dataclass'` (default), `'pydantic'`, or `'attrs'`.
+        directory_walk (bool): If `True`, recursively searches for Python files
+            within a directory. If `False`, only searches the immediate directory
+            for Python files. Only applicable if a directory is passed as the
+            `source` argument.
+        multiprocessing (`MultiprocessingSettings`): Settings to enable and
+            configure multiprocessing.
+
+    Returns:
+        Optional[List[`RootModel`]]: A list of `RootModel` instances representing
+            unreferenced class definitions across all files, or `None` if no root
+            models are found.
+    """
     consolidated_classes = _XSDataCollectedClasses(xsd_models)
+
+    # Normalize sources into a list of file paths
+    if isinstance(source, (str, PathLike)) and Path(source).is_dir():
+        source = list(
+            Path(source).rglob("*.py") if directory_walk
+            else Path(source).glob("*.py")
+        )
+    elif isinstance(source, (str, PathLike)):
+        source = [Path(source)]
+
+    # Apply multiprocessing if enabled by user
     if multiprocessing.enabled:
         with ThreadPoolExecutor(multiprocessing.max_workers) as thread_executor:
             futures = {
                 thread_executor.submit(
-                    consolidated_classes.visit_and_consolidate_by_path, source
-                ): source
-                for source in sources
+                    consolidated_classes.visit_and_consolidate_by_path, path
+                ): path
+                for path in source
             }
             for future in as_completed(futures):
                 fut_source = futures[future]
@@ -545,8 +677,9 @@ def root_finders(
                         raise XSDataRootFinderError(
                             "Task was not completed succesfully", Path(fut_source)
                         ) from e
+    # Otherwise, default to iteration of sources
     else:
-        for source in sources:
-            consolidated_classes.visit_and_consolidate_by_path(source)
+        for path in source:
+            consolidated_classes.visit_and_consolidate_by_path(path)
 
     return consolidated_classes.root_finder()
