@@ -1,4 +1,3 @@
-
 [tool.poetry]
 name = "xsdata-rootfinder"
 version = "0.1.0"
