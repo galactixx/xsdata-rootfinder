@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import importlib.util
 import re
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from functools import lru_cache
 from os import PathLike
 from pathlib import Path
 from typing import (
@@ -151,6 +153,29 @@ def _decompose_module(module: str) -> List[str]:
     return module.split(".")
 
 
+@lru_cache(maxsize=None)
+def _is_from_standard_library(module: str) -> bool:
+    """"""
+    spec = importlib.util.find_spec(module)
+    return spec is not None and spec.origin == "stdlib"
+
+
+@lru_cache(maxsize=None)
+def _module_has_class(path: Path, name: str) -> bool:
+    """"""
+    if not path.exists():
+        return False
+
+    python_code = _read_python_file(path)
+    module = cst.parse_module(python_code)
+    class_def_visitor = _XSDataClassDefFinderVisitor(name)
+    try:
+        module.visit(class_def_visitor)
+    except _XSDataStopTraversalError:
+        pass
+    return class_def_visitor.found
+
+
 def _parse_import_alias(import_alias: cst.ImportAlias) -> Tuple[str, _ImportIdentifier]:
     """Parses an import alias into its alias and module components."""
     alias: _ModuleType
@@ -164,50 +189,10 @@ def _parse_import_alias(import_alias: cst.ImportAlias) -> Tuple[str, _ImportIden
     return alias, module
 
 
-def _find_all_types_in_subscript(
-    subscript: cst.Subscript, path: Optional[Path]
-) -> Set[_ReferencedClass]:
-    """
-    Returns a set of class names found within a `libcst.Subscript` object.
-    Traverses recursively through the entire object to find all references
-    to classes.
-    """
-    classes_found: Set[_ReferencedClass] = set()
+class _XSDataStopTraversalError(Exception):
+    """"""
 
-    def add_module(name: str) -> None:
-        res = _ReferencedClass(path, name)
-        classes_found.add(res)
-
-    def traversal(base_slice: cst.BaseSlice) -> None:
-        slice_index = cast(cst.Index, base_slice)
-        slice_index_value = slice_index.value
-
-        # If the value of the index is a cst.Subscript, then
-        # iteration through each value needs to occur and
-        # recursion continues
-        if isinstance(slice_index_value, cst.Subscript):
-            for sub_element in slice_index_value.slice:
-                traversal(sub_element.slice)
-
-        # If the value is a cst.Attribute, then extract the
-        # value of the top-level portion of the attribute
-        elif isinstance(slice_index_value, cst.Attribute):
-            add_module(slice_index_value.attr.value)
-
-        # Simply extract the value if object is a cst.Name
-        elif isinstance(slice_index_value, cst.Name):
-            add_module(slice_index_value.value)
-
-        # If there is a reference to a class as a string, due
-        # to TYPE_CHECKING, then strip the value of extra
-        # quotations and add to set of classes encountered
-        elif isinstance(slice_index_value, cst.SimpleString):
-            add_module(slice_index_value.value.strip('"'))
-
-    for sub_element in subscript.slice:
-        traversal(sub_element.slice)
-
-    return classes_found
+    pass
 
 
 class XSDataRootFinderError(Exception):
@@ -336,6 +321,37 @@ class _ImportIdentifier:
             value = levels[-1]
             return cls(value, attribute)
 
+    def module_to_path(self, included_in_path: Path) -> Optional[Path]:
+        """"""
+        as_path = Path(*self.parts).parent.with_suffix(".py")
+
+        # First test for whether the module is in the same directory
+        same_dir_path = included_in_path.with_name(as_path.name)
+        if _module_has_class(same_dir_path, self.value):
+            return same_dir_path
+
+        # Next, test for whether the module is in a deeper directory
+        deeper_path = included_in_path.parent / as_path
+        if _module_has_class(deeper_path, self.value):
+            return deeper_path
+
+        # Finally, we assume the path is in another directory
+        cur_as_path = Path()
+        for part in as_path.parts:
+            cur_as_path = cur_as_path / part
+
+            pattern = re.compile(f"({re.escape(str(cur_as_path))})")
+            sub_path_match = pattern.search(str(included_in_path))
+
+            if sub_path_match is not None:
+                for match in range(1, len(sub_path_match.groups()) + 1):
+                    common_path = sub_path_match.group(match)
+                    extra_path = str(included_in_path)[: sub_path_match.start(match)]
+                    pred_path = Path(extra_path, common_path)
+                    if _module_has_class(pred_path, self.value):
+                        return pred_path
+        return None
+
 
 @dataclass(frozen=True)
 class RootModel:
@@ -415,6 +431,20 @@ class MultiprocessingSettings:
     timeout: Optional[int] = None
 
 
+class _XSDataClassDefFinderVisitor(cst.CSTVisitor):
+    """"""
+
+    def __init__(self, class_name: str) -> None:
+        self.class_name = class_name
+        self.found = False
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> bool:
+        self.found = node.name.value == self.class_name
+        if self.found:
+            raise _XSDataStopTraversalError
+        return not self.found
+
+
 class _XSDataRootFinderVisitor(cst.CSTVisitor):
     """
     A visitor class to parse and extract class references from Python
@@ -460,7 +490,14 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         Adds a `_ReferencedClass` object representing a class name to the
         reference set.
         """
-        ref_class = _ReferencedClass(self.path, name)
+        if _is_from_standard_library(name):
+            return None
+
+        in_module_ref = _ReferencedClass(self.path, name)
+        ref_class = in_module_ref if self.path is None else self._get_local_import(name)
+
+        if ref_class is None:
+            ref_class = in_module_ref
         self.ref_classes.add(ref_class)
 
     def _attribute_ann_assign(self, node: cst.Attribute) -> None:
@@ -475,13 +512,66 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
 
     def _subscript_ann_assign(self, node: cst.Subscript) -> None:
         """Handles annotations that are subscripted types (e.g., List[int])."""
-        ref_classes = _find_all_types_in_subscript(node, self.path)
-        self.ref_classes.update(ref_classes)
+
+        def find_all_types_in_subscript(subscript: cst.Subscript) -> None:
+            """
+            Parses and retrieves all class names found within a `libcst.Subscript` object.
+            Traverses recursively through the entire object to find all references
+            to classes.
+            """
+
+            def traversal(base_slice: cst.BaseSlice) -> None:
+                slice_index = cast(cst.Index, base_slice)
+                slice_index_value = slice_index.value
+
+                # If the value of the index is a cst.Subscript, then
+                # iteration through each value needs to occur and
+                # recursion continues
+                if isinstance(slice_index_value, cst.Subscript):
+                    for sub_element in slice_index_value.slice:
+                        traversal(sub_element.slice)
+
+                # If the value is a cst.Attribute, then extract the
+                # value of the top-level portion of the attribute
+                elif isinstance(slice_index_value, cst.Attribute):
+                    self._add_class_to_refs(slice_index_value.attr.value)
+
+                # Simply extract the value if object is a cst.Name
+                elif isinstance(slice_index_value, cst.Name):
+                    self._add_class_to_refs(slice_index_value.value)
+
+                # If there is a reference to a class as a string, due
+                # to TYPE_CHECKING, then strip the value of extra
+                # quotations and add to set of classes encountered
+                elif isinstance(slice_index_value, cst.SimpleString):
+                    self._add_class_to_refs(slice_index_value.value.strip('"'))
+
+            for sub_element in subscript.slice:
+                traversal(sub_element.slice)
+
+        find_all_types_in_subscript(node)
 
     def _simple_string_ann_assign(self, node: cst.SimpleString) -> None:
         """Handles annotations represented as simple strings (e.g., "MyClass")."""
         class_name = node.value.strip('"')
         self._add_class_to_refs(class_name)
+
+    def _get_local_import(self, module: str) -> Optional[_ReferencedClass]:
+        """"""
+        identifier = _ImportIdentifier.from_levels(_decompose_module(module))
+        found_module = self.imports.find_common_import(identifier)
+        if found_module is not None:
+            module_from_file = self.imports.get_import(found_module)
+            path_from_module = module_from_file.module_to_path(cast(Path, self.path))
+            if path_from_module is not None:
+                return _ReferencedClass(path_from_module, module_from_file.value)
+        return None
+
+    def _get_inherited_local_classes(self, node: cst.ClassDef) -> None:
+        """"""
+        for decorator in node.decorators:
+            identifier = _parse_imported_module(cast(_ModuleType, decorator.decorator))
+            self._add_class_to_refs(identifier.module)
 
     def visit_Import(self, node: cst.Import) -> None:
         """Parses and consolidates any import statements found."""
@@ -511,11 +601,13 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         Set the currently visited `libcst.ClassDef` object and updates the
         defined class store.
         """
-        if not self.class_trace:
+        if not self.class_trace:  # To ensure only top-level classes are parsed
             span = self.get_metadata(PositionProvider, node)
             root_model = RootModel._from_cst_class(span, node, self.path)
             self.defined_classes.add(root_model)
 
+            # Check if any generated models are inherited
+            self._get_inherited_local_classes(node)
         self.class_trace.appendleft(node)
 
     def leave_ClassDef(self, _: cst.ClassDef) -> None:
@@ -585,7 +677,7 @@ def _python_source_visit(
     """
     Parses a Python source file and extracts class definitions and references.
     """
-    source_path = None if not Path(source).is_file() else Path(source)
+    source_path = None if not Path(source).is_file() else Path(source).resolve()
     source = _read_python_file(source)
     python_module = MetadataWrapper(cst.parse_module(source))
     visitor = _XSDataRootFinderVisitor(xsd_models, source_path)
@@ -624,6 +716,7 @@ def root_finders(
     source: Union[StrOrPath, Collection[StrOrPath]],
     xsd_models: XsdModels = "dataclass",
     directory_walk: bool = False,
+    ignore_init_files: bool = True,
     multiprocessing: MultiprocessingSettings = MultiprocessingSettings(),
 ) -> Optional[List[RootModel]]:
     """
@@ -654,6 +747,10 @@ def root_finders(
             unreferenced class definitions across all files, or `None` if no root
             models are found.
     """
+
+    def is_init_file(path: StrOrPath) -> bool:
+        return ignore_init_files and Path(path).name == "__init__.py"
+
     consolidated_classes = _XSDataCollectedClasses(xsd_models)
 
     # Normalize sources into a list of file paths
@@ -672,6 +769,7 @@ def root_finders(
                     consolidated_classes.visit_and_consolidate_by_path, path
                 ): path
                 for path in source
+                if not is_init_file(path)
             }
             for future in as_completed(futures):
                 fut_source = futures[future]
@@ -691,6 +789,7 @@ def root_finders(
     # Otherwise, default to iteration of sources
     else:
         for path in source:
-            consolidated_classes.visit_and_consolidate_by_path(path)
+            if not is_init_file(path):
+                consolidated_classes.visit_and_consolidate_by_path(path)
 
     return consolidated_classes.root_finder()
