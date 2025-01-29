@@ -250,7 +250,7 @@ class _XSDataCollectedClasses:
         """Process and consolidate data from a source file as a `StrOrPath` object."""
         if not Path(source).is_file():
             raise FileNotFoundError(
-                "every object in 'source' argument must must link to an existing file"
+                "Every object in 'source' argument must must link to an existing file"
             )
 
         self.visit_and_consolidate(source)
@@ -321,35 +321,34 @@ class _ImportIdentifier:
             value = levels[-1]
             return cls(value, attribute)
 
-    def module_to_path(self, included_in_path: Path) -> Optional[Path]:
+    def module_to_path(self, py_file_path: Path) -> Optional[Path]:
         """"""
-        as_path = Path(*self.parts).parent.with_suffix(".py")
+        module_as_path = Path(*self.parts).parent.with_suffix(".py")
 
         # First test for whether the module is in the same directory
-        same_dir_path = included_in_path.with_name(as_path.name)
+        same_dir_path = py_file_path.with_name(module_as_path.name)
         if _module_has_class(same_dir_path, self.value):
             return same_dir_path
 
         # Next, test for whether the module is in a deeper directory
-        deeper_path = included_in_path.parent / as_path
+        deeper_path = py_file_path.parent / module_as_path
         if _module_has_class(deeper_path, self.value):
             return deeper_path
 
         # Finally, we assume the path is in another directory
-        cur_as_path = Path()
-        for part in as_path.parts:
-            cur_as_path = cur_as_path / part
+        py_file_path_str = str(py_file_path)
+        pattern = re.compile(f"({re.escape(module_as_path.parts[0])})")
+        sub_path_match = pattern.search(py_file_path_str)
 
-            pattern = re.compile(f"({re.escape(str(cur_as_path))})")
-            sub_path_match = pattern.search(str(included_in_path))
+        if sub_path_match is not None:
+            for match in range(1, len(sub_path_match.groups()) + 1):
+                common_path = sub_path_match.group(match)
+                start_path = py_file_path_str[: sub_path_match.start(match)]
 
-            if sub_path_match is not None:
-                for match in range(1, len(sub_path_match.groups()) + 1):
-                    common_path = sub_path_match.group(match)
-                    extra_path = str(included_in_path)[: sub_path_match.start(match)]
-                    pred_path = Path(extra_path, common_path)
-                    if _module_has_class(pred_path, self.value):
-                        return pred_path
+                pred_path = Path(start_path, common_path, *self.parts[1:])
+                pred_path = pred_path.parent.with_suffix(".py")
+                if _module_has_class(pred_path, self.value):
+                    return pred_path
         return None
 
 
@@ -560,11 +559,23 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         """"""
         identifier = _ImportIdentifier.from_levels(_decompose_module(module))
         found_module = self.imports.find_common_import(identifier)
+        py_source_path = cast(Path, self.path)
+
+        # Check if is not appearing in an "import *"
         if found_module is not None:
             module_from_file = self.imports.get_import(found_module)
-            path_from_module = module_from_file.module_to_path(cast(Path, self.path))
+            path_from_module = module_from_file.module_to_path(py_source_path)
             if path_from_module is not None:
                 return _ReferencedClass(path_from_module, module_from_file.value)
+
+        # Check whether it was imported in an "import *"
+        for star in self.imports.import_stars:
+            star_module = _ImportIdentifier.from_levels(
+                _decompose_module(star) + identifier.parts
+            )
+            star_path = star_module.module_to_path(py_source_path)
+            if star_path is not None:
+                return _ReferencedClass(star_path, star_module.value)
         return None
 
     def _get_inherited_local_classes(self, node: cst.ClassDef) -> None:
@@ -581,10 +592,18 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
 
     def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
         """Parses and consolidates any import-from statements found."""
-        if node.module is None:
-            return None
+        if len(node.relative) and self.path is not None:
+            start_index = len(self.path.parts) - len(node.relative) - 1
+            module = _ImportIdentifier(self.path.parts[start_index])
 
-        module = _parse_imported_module(node.module)
+            if node.module is not None:
+                non_relative_module = _parse_imported_module(node.module)
+                module = _ImportIdentifier.from_levels(
+                    module.parts + non_relative_module.parts
+                )
+        else:
+            module = _parse_imported_module(cast(_ModuleType, node.module))
+
         if isinstance(node.names, cst.ImportStar):
             self.imports.add_import_star(module)
             return None
