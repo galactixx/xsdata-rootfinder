@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+import os
+import sysconfig
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Collection
@@ -12,6 +14,7 @@ from functools import lru_cache
 from os import PathLike
 from pathlib import Path
 from typing import (
+    Any,
     ClassVar,
     Deque,
     Dict,
@@ -45,6 +48,16 @@ XsdModels: TypeAlias = Literal["dataclass", "pydantic", "attrs"]
 
 # Constants and global variables
 _MAX_RETRIES = 3
+_PRIMITIVE_TYPES = {
+    "int",
+    "str",
+    "float",
+    "bool",
+    "complex",
+    "bytes",
+    "bytearray",
+    "memoryview",
+}
 
 
 class _AbstractModelCheck(ABC):
@@ -161,11 +174,44 @@ def _decompose_module(module: str) -> List[str]:
     return module.split(".")
 
 
+def _is_xsdata_import(module: _ImportIdentifier) -> bool:
+    """"""
+    return module.module.startswith("xsdata")
+
+
+def _is_builtin_type(annotation: str) -> bool:
+    """"""
+    return annotation in _PRIMITIVE_TYPES
+
+
+def _normalize_path(path: str) -> str:
+    """"""
+    return os.path.normcase(os.path.normpath(path))
+
+
 @lru_cache(maxsize=None)
-def _is_from_standard_library(module: str) -> bool:
+def _is_from_standard_library(module: _ImportIdentifier) -> bool:
     """Determine if the given module is part of the Python standard library."""
-    spec = importlib.util.find_spec(module)
-    return spec is not None and spec.origin == "stdlib"
+    module_parts = module.parts
+    name = module_parts[0]
+    package = module_parts[1:] if len(module_parts) > 1 else None
+
+    spec = importlib.util.find_spec(name, package)
+    if spec is None or spec.origin is None:
+        return False
+
+    stdlib_path = sysconfig.get_paths()["stdlib"]
+    third_party_paths = {
+        _normalize_path(sysconfig.get_paths()[path]) for path in ["purelib", "platlib"]
+    }
+
+    # Normalize paths for comparison
+    stdlib_path = _normalize_path(stdlib_path)
+    origin_path = _normalize_path(spec.origin)
+
+    is_third_party = any(origin_path.startswith(path) for path in third_party_paths)
+    is_stdlib_path = origin_path.startswith(stdlib_path)
+    return not is_third_party and is_stdlib_path
 
 
 @lru_cache(maxsize=None)
@@ -507,14 +553,26 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         Adds a `_ReferencedClass` object representing a class name to the
         reference set.
         """
-        if _is_from_standard_library(name):
+        IN_MODULE_REF = _ReferencedClass(self.path, name)
+        if _is_builtin_type(name):
             return None
 
-        in_module_ref = _ReferencedClass(self.path, name)
-        ref_class = in_module_ref if self.path is None else self._get_local_import(name)
+        identifier = _ImportIdentifier.from_levels(_decompose_module(name))
+        found_import = self.imports.find_common_import(identifier)
+
+        if self.path is not None and found_import is not None:
+            module_from_file = self.imports.get_import(found_import)
+            if _is_from_standard_library(module_from_file) or _is_xsdata_import(
+                module_from_file
+            ):
+                return None
+
+            ref_class = self._get_local_import(module_from_file, self.path)
+        else:
+            ref_class = self._get_local_import_star(identifier, self.path)
 
         if ref_class is None:
-            ref_class = in_module_ref
+            ref_class = IN_MODULE_REF
         self.ref_classes.add(ref_class)
 
     def _attribute_ann_assign(self, node: cst.Attribute) -> None:
@@ -573,25 +631,24 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         class_name = node.value.strip('"')
         self._add_class_to_refs(class_name)
 
-    def _get_local_import(self, module: str) -> Optional[_ReferencedClass]:
+    def _get_local_import(
+        self, identifier: _ImportIdentifier, path: Path
+    ) -> Optional[_ReferencedClass]:
         """Retrieve a locally imported class as a `_ReferencedClass`, if available."""
-        identifier = _ImportIdentifier.from_levels(_decompose_module(module))
-        found_module = self.imports.find_common_import(identifier)
-        py_source_path = cast(Path, self.path)
+        path_from_module = identifier.module_to_path(path)
+        if path_from_module is not None:
+            return _ReferencedClass(path_from_module, identifier.value)
+        return None
 
-        # Check if is not appearing in an "import *"
-        if found_module is not None:
-            module_from_file = self.imports.get_import(found_module)
-            path_from_module = module_from_file.module_to_path(py_source_path)
-            if path_from_module is not None:
-                return _ReferencedClass(path_from_module, module_from_file.value)
-
-        # Check whether it was imported in an "import *"
+    def _get_local_import_star(
+        self, identifier: _ImportIdentifier, path: Path
+    ) -> Optional[_ReferencedClass]:
+        """Retrieve a locally imported class as a `_ReferencedClass`, if available."""
         for star in self.imports.import_stars:
             star_module = _ImportIdentifier.from_levels(
                 _decompose_module(star) + identifier.parts
             )
-            star_path = star_module.module_to_path(py_source_path)
+            star_path = star_module.module_to_path(path)
             if star_path is not None:
                 return _ReferencedClass(star_path, star_module.value)
         return None
