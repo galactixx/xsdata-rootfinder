@@ -140,6 +140,7 @@ def _root_finder(
     root_classes = [
         root_model for root_model in defs if root_model._referenced_class not in refs
     ]
+    root_classes.sort(key=lambda x: (x.path, x.name))
     return None if not root_classes else root_classes
 
 
@@ -155,14 +156,17 @@ def _decompose_module(module: str) -> List[str]:
 
 @lru_cache(maxsize=None)
 def _is_from_standard_library(module: str) -> bool:
-    """"""
+    """Determine if the given module is part of the Python standard library."""
     spec = importlib.util.find_spec(module)
     return spec is not None and spec.origin == "stdlib"
 
 
 @lru_cache(maxsize=None)
 def _module_has_class(path: Path, name: str) -> bool:
-    """"""
+    """
+    Check if a class with the given name exists in the Python module at the
+    specified path.
+    """
     if not path.exists():
         return False
 
@@ -190,7 +194,7 @@ def _parse_import_alias(import_alias: cst.ImportAlias) -> Tuple[str, _ImportIden
 
 
 class _XSDataStopTraversalError(Exception):
-    """"""
+    """Custom exception to stop CST traversal when a target class is found."""
 
     pass
 
@@ -322,7 +326,10 @@ class _ImportIdentifier:
             return cls(value, attribute)
 
     def module_to_path(self, py_file_path: Path) -> Optional[Path]:
-        """"""
+        """
+        Resolve the file path of the module by checking different directory
+        structures relative to the given Python file path.
+        """
         module_as_path = Path(*self.parts).parent.with_suffix(".py")
 
         # First test for whether the module is in the same directory
@@ -431,13 +438,17 @@ class MultiprocessingSettings:
 
 
 class _XSDataClassDefFinderVisitor(cst.CSTVisitor):
-    """"""
+    """A visitor class to search for a class definition in a CST module."""
 
     def __init__(self, class_name: str) -> None:
         self.class_name = class_name
         self.found = False
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:
+        """
+        Visit a class definition node and check if its name matches the target
+        class name.
+        """
         self.found = node.name.value == self.class_name
         if self.found:
             raise _XSDataStopTraversalError
@@ -556,7 +567,7 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         self._add_class_to_refs(class_name)
 
     def _get_local_import(self, module: str) -> Optional[_ReferencedClass]:
-        """"""
+        """Retrieve a locally imported class as a `_ReferencedClass`, if available."""
         identifier = _ImportIdentifier.from_levels(_decompose_module(module))
         found_module = self.imports.find_common_import(identifier)
         py_source_path = cast(Path, self.path)
@@ -579,9 +590,9 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         return None
 
     def _get_inherited_local_classes(self, node: cst.ClassDef) -> None:
-        """"""
-        for decorator in node.decorators:
-            identifier = _parse_imported_module(cast(_ModuleType, decorator.decorator))
+        """Identify and add local classes inherited by the current class node."""
+        for base_class in node.bases:
+            identifier = _parse_imported_module(cast(_ModuleType, base_class.value))
             self._add_class_to_refs(identifier.module)
 
     def visit_Import(self, node: cst.Import) -> None:
@@ -758,6 +769,8 @@ def root_finders(
             within a directory. If `False`, only searches the immediate directory
             for Python files. Only applicable if a directory is passed as the
             `source` argument.
+        ignore_init_files (bool): If `True`, ignores Python `__init__.py` files
+            during the root-finding process.
         multiprocessing (`MultiprocessingSettings`): Settings to enable and
             configure multiprocessing.
 
