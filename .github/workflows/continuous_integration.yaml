@@ -26,8 +26,6 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Set Git core.autocrlf to true
-        run: git config --global core.autocrlf true
       - name: install-dependencies
         run: |
           pip install -U pip setuptools wheel
