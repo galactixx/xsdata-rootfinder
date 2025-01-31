@@ -1,3 +1,4 @@
 -r requirements.txt
+xsdata
 pytest
 pytest-cov
