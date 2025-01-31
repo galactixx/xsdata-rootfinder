@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import sys
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Collection
@@ -20,10 +21,16 @@ from typing import (
     Set,
     Tuple,
     Type,
-    TypeAlias,
     Union,
     cast,
 )
+
+IS_PY_3_1 = sys.version_info >= (3, 10)
+
+if IS_PY_3_1:
+    from typing import TypeAlias
+else:
+    from typing_extensions import TypeAlias
 
 import libcst as cst
 from libcst.metadata import CodeRange, MetadataWrapper, PositionProvider
