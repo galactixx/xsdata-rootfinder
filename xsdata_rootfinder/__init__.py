@@ -14,7 +14,6 @@ from functools import lru_cache
 from os import PathLike
 from pathlib import Path
 from typing import (
-    Any,
     ClassVar,
     Deque,
     Dict,
@@ -28,9 +27,9 @@ from typing import (
     cast,
 )
 
-IS_PY_3_1 = sys.version_info >= (3, 10)
+IS_PY_3_10 = sys.version_info >= (3, 10)
 
-if IS_PY_3_1:
+if IS_PY_3_10:
     from typing import TypeAlias
 else:
     from typing_extensions import TypeAlias
@@ -46,7 +45,17 @@ StrOrPath: TypeAlias = Union[str, PathLike[str]]
 CodeOrStrOrPath: TypeAlias = Union[str, PathLike[str]]
 XsdModels: TypeAlias = Literal["dataclass", "pydantic", "attrs"]
 
+
+def _normalize_path(path: str) -> str:
+    """"""
+    return os.path.normcase(os.path.normpath(path))
+
+
 # Constants and global variables
+STDLIB_PATH = _normalize_path(sysconfig.get_paths()["stdlib"])
+THIRDPTYLIB_PATHS: Set[str] = {
+    _normalize_path(sysconfig.get_paths()[path]) for path in ("purelib", "platlib")
+}
 _MAX_RETRIES = 3
 _PRIMITIVE_TYPES = {
     "int",
@@ -184,53 +193,47 @@ def _is_builtin_type(annotation: str) -> bool:
     return annotation in _PRIMITIVE_TYPES
 
 
-def _normalize_path(path: str) -> str:
-    """"""
-    return os.path.normcase(os.path.normpath(path))
-
-
 @lru_cache(maxsize=None)
-def _is_from_standard_library(module: _ImportIdentifier) -> bool:
-    """Determine if the given module is part of the Python standard library."""
+def _find_import_spec(module: _ImportIdentifier) -> PythonModuleSpec:
+    """"""
     module_parts = module.parts
     name = module_parts[0]
-    package = module_parts[1:] if len(module_parts) > 1 else None
-
+    package = (
+        _create_module_from_levels(module_parts[1:]) if len(module_parts) > 1 else None
+    )
     spec = importlib.util.find_spec(name, package)
-    if spec is None or spec.origin is None:
-        return False
 
-    stdlib_path = sysconfig.get_paths()["stdlib"]
-    third_party_paths = {
-        _normalize_path(sysconfig.get_paths()[path]) for path in ["purelib", "platlib"]
-    }
+    is_stdlib = False
+    is_third_party = False
 
-    # Normalize paths for comparison
-    stdlib_path = _normalize_path(stdlib_path)
-    origin_path = _normalize_path(spec.origin)
-
-    is_third_party = any(origin_path.startswith(path) for path in third_party_paths)
-    is_stdlib_path = origin_path.startswith(stdlib_path)
-    return not is_third_party and is_stdlib_path
+    if spec is not None and spec.origin is not None:
+        origin_path = _normalize_path(spec.origin)
+        is_third_party = any(origin_path.startswith(path) for path in THIRDPTYLIB_PATHS)
+        is_stdlib_path = origin_path.startswith(STDLIB_PATH)
+        is_stdlib = is_stdlib_path and not is_third_party
+    return PythonModuleSpec(module, is_third_party, is_stdlib)
 
 
 @lru_cache(maxsize=None)
+def _get_module_defined_classes(path: Path) -> Set[str]:
+    """"""
+    if not path.exists():
+        return set()
+
+    python_code = _read_python_file(path)
+    module = cst.parse_module(python_code)
+    class_def_visitor = _XSDataClassDefFinderVisitor()
+    module.visit(class_def_visitor)
+    return class_def_visitor.defined_classes
+
+
 def _module_has_class(path: Path, name: str) -> bool:
     """
     Check if a class with the given name exists in the Python module at the
     specified path.
     """
-    if not path.exists():
-        return False
-
-    python_code = _read_python_file(path)
-    module = cst.parse_module(python_code)
-    class_def_visitor = _XSDataClassDefFinderVisitor(name)
-    try:
-        module.visit(class_def_visitor)
-    except _XSDataStopTraversalError:
-        pass
-    return class_def_visitor.found
+    defined_classes = _get_module_defined_classes(path)
+    return name in defined_classes
 
 
 def _parse_import_alias(import_alias: cst.ImportAlias) -> Tuple[str, _ImportIdentifier]:
@@ -244,12 +247,6 @@ def _parse_import_alias(import_alias: cst.ImportAlias) -> Tuple[str, _ImportIden
     alias = _parse_imported_module(alias).module
     module = _parse_imported_module(import_alias.name)
     return alias, module
-
-
-class _XSDataStopTraversalError(Exception):
-    """Custom exception to stop CST traversal when a target class is found."""
-
-    pass
 
 
 class XSDataRootFinderError(Exception):
@@ -276,6 +273,25 @@ class XSDataRootFinderError(Exception):
 
     def __repr__(self) -> str:
         return self.message
+
+
+@dataclass(frozen=True)
+class PythonModuleSpec:
+    """"""
+
+    identifier: _ImportIdentifier
+    third_party_import: bool
+    stdlib_import: bool
+
+    @property
+    def irrelevant_module(self) -> bool:
+        """"""
+        return self.stdlib_import or _is_xsdata_import(self.identifier)
+
+    @property
+    def is_python_library(self) -> bool:
+        """"""
+        return self.third_party_import or self.stdlib_import
 
 
 @dataclass
@@ -305,6 +321,7 @@ class _XSDataCollectedClasses:
 
     def visit_and_consolidate_by_path(self, source: StrOrPath) -> None:
         """Process and consolidate data from a source file as a `StrOrPath` object."""
+        print(source)
         if not Path(source).is_file():
             raise FileNotFoundError(
                 "Every object in 'source' argument must must link to an existing file"
@@ -467,17 +484,24 @@ class _ReferencedClass:
     name: str
 
 
+@dataclass
+class _LocalImportSearch:
+    """"""
+
+    referenced_class: Optional[_ReferencedClass] = None
+    is_python_library: bool = False
+
+
 @dataclass(frozen=True)
 class MultiprocessingSettings:
     """
     Settings for enabling and configuring multiprocessing.
 
     This class encapsulates the configuration for running tasks in parallel
-    using multiprocessing. It allows enabling or disabling multiprocessing,
-    setting the number of worker threads, and defining a timeout for each task.
+    using multiprocessing. It allows setting the number of worker threads,
+    and defining a timeout for each task.
 
     Attributes:
-        enabled (bool): Whether multiprocessing is enabled. Default is `False`.
         max_workers (int | None): The maximum number of workers (threads)
             to use for multiprocessing. If `None`, the default thread pool size
             is used.
@@ -485,27 +509,26 @@ class MultiprocessingSettings:
             no timeout is applied.
     """
 
-    enabled: bool = False
     max_workers: Optional[int] = None
     timeout: Optional[int] = None
 
 
 class _XSDataClassDefFinderVisitor(cst.CSTVisitor):
-    """A visitor class to search for a class definition in a CST module."""
+    """A visitor class to search for all class definitions in a CST module."""
 
-    def __init__(self, class_name: str) -> None:
-        self.class_name = class_name
-        self.found = False
+    def __init__(self) -> None:
+        self.defined_classes: Set[str] = set()
+        self.class_trace: Deque[str] = deque([])
 
-    def visit_ClassDef(self, node: cst.ClassDef) -> bool:
-        """
-        Visit a class definition node and check if its name matches the target
-        class name.
-        """
-        self.found = node.name.value == self.class_name
-        if self.found:
-            raise _XSDataStopTraversalError
-        return not self.found
+    def visit_ClassDef(self, node: cst.ClassDef) -> None:
+        """Visit a class definition node and append to set of defined classes."""
+        if not self.class_trace:
+            self.defined_classes.add(node.name.value)
+        self.class_trace.appendleft(node.name.value)
+
+    def leave_ClassDef(self, _: cst.ClassDef) -> None:
+        """Clear the currently visited `libcst.ClassDef` object."""
+        self.class_trace.popleft()
 
 
 class _XSDataRootFinderVisitor(cst.CSTVisitor):
@@ -523,8 +546,9 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         self.class_trace: Deque[cst.ClassDef] = deque([])
         self.ref_classes: Set[_ReferencedClass] = set()
         self.defined_classes: Set[RootModel] = set()
+        self.defined_class_names: Set[str] = set()
 
-    def _is_relevant_model(self) -> bool:
+    def _is_relevant_model(self, class_node: cst.ClassDef) -> bool:
         """
         Determines if a given `libcst.ClassDef` object is a class that was
         generated by `xsdata`.
@@ -542,9 +566,6 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
             )
 
         model_check = ModelCheck(self.imports)
-
-        class_node = self.class_trace.popleft()
-        self.class_trace.appendleft(class_node)
         is_valid_model = model_check.run_model_check(class_node)
         return is_valid_model
 
@@ -553,26 +574,41 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         Adds a `_ReferencedClass` object representing a class name to the
         reference set.
         """
-        IN_MODULE_REF = _ReferencedClass(self.path, name)
+        search: Optional[_LocalImportSearch] = None
         if _is_builtin_type(name):
             return None
 
-        identifier = _ImportIdentifier.from_levels(_decompose_module(name))
-        found_import = self.imports.find_common_import(identifier)
+        if name in self.defined_class_names or self.path is None:
+            ref_class = _ReferencedClass(self.path, name)
+        else:
+            identifier = _ImportIdentifier.from_levels(_decompose_module(name))
+            found_import = self.imports.find_common_import(identifier)
 
-        if self.path is not None and found_import is not None:
-            module_from_file = self.imports.get_import(found_import)
-            if _is_from_standard_library(module_from_file) or _is_xsdata_import(
-                module_from_file
+            if found_import is not None:
+                module_from_file = self.imports.get_import(found_import)
+                import_spec = _find_import_spec(module_from_file)
+                if import_spec.irrelevant_module:
+                    return None
+
+                search = self._get_local_import(module_from_file, self.path)
+                search.is_python_library = import_spec.third_party_import
+
+            if found_import is None or (
+                search is not None and search.referenced_class is None
+            ):
+                search = self._get_local_import_star(identifier, self.path)
+
+            if (
+                search is not None
+                and search.referenced_class is None
+                and search.is_python_library
             ):
                 return None
 
-            ref_class = self._get_local_import(module_from_file, self.path)
-        else:
-            ref_class = self._get_local_import_star(identifier, self.path)
-
-        if ref_class is None:
-            ref_class = IN_MODULE_REF
+            if search is not None and search.referenced_class is not None:
+                ref_class = search.referenced_class
+            else:
+                ref_class = _ReferencedClass(self.path, identifier.value)
         self.ref_classes.add(ref_class)
 
     def _attribute_ann_assign(self, node: cst.Attribute) -> None:
@@ -633,25 +669,42 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
 
     def _get_local_import(
         self, identifier: _ImportIdentifier, path: Path
-    ) -> Optional[_ReferencedClass]:
-        """Retrieve a locally imported class as a `_ReferencedClass`, if available."""
+    ) -> _LocalImportSearch:
+        """Retrieve a locally imported class as a `_LocalImportSearch`, if available."""
+        local_import_search = _LocalImportSearch()
         path_from_module = identifier.module_to_path(path)
         if path_from_module is not None:
-            return _ReferencedClass(path_from_module, identifier.value)
-        return None
+            local_import_search.referenced_class = _ReferencedClass(
+                path_from_module, identifier.value
+            )
+        return local_import_search
 
     def _get_local_import_star(
         self, identifier: _ImportIdentifier, path: Path
-    ) -> Optional[_ReferencedClass]:
-        """Retrieve a locally imported class as a `_ReferencedClass`, if available."""
+    ) -> _LocalImportSearch:
+        """Retrieve a locally imported class as a `_LocalImportSearch`, if available."""
+        local_import_search = _LocalImportSearch()
         for star in self.imports.import_stars:
             star_module = _ImportIdentifier.from_levels(
                 _decompose_module(star) + identifier.parts
             )
+            import_spec = _find_import_spec(star_module)
+            if import_spec.irrelevant_module:
+                continue
+
             star_path = star_module.module_to_path(path)
             if star_path is not None:
-                return _ReferencedClass(star_path, star_module.value)
-        return None
+                local_import_search.referenced_class = _ReferencedClass(
+                    star_path, star_module.value
+                )
+                break
+
+            if (
+                import_spec.is_python_library
+                and not local_import_search.is_python_library
+            ):
+                local_import_search.is_python_library = True
+        return local_import_search
 
     def _get_inherited_local_classes(self, node: cst.ClassDef) -> None:
         """Identify and add local classes inherited by the current class node."""
@@ -695,10 +748,12 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         Set the currently visited `libcst.ClassDef` object and updates the
         defined class store.
         """
-        if not self.class_trace:  # To ensure only top-level classes are parsed
+        # To ensure only top-level classes are parsed
+        if not self.class_trace and self._is_relevant_model(node):
             span = self.get_metadata(PositionProvider, node)
             root_model = RootModel._from_cst_class(span, node, self.path)
             self.defined_classes.add(root_model)
+            self.defined_class_names.add(node.name.value)
 
             # Check if any generated models are inherited
             self._get_inherited_local_classes(node)
@@ -706,11 +761,13 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
 
     def leave_ClassDef(self, _: cst.ClassDef) -> None:
         """Clear the currently visited `libcst.ClassDef` object."""
-        _ = self.class_trace.popleft()
+        self.class_trace.popleft()
 
     def visit_AnnAssign(self, node: cst.AnnAssign) -> None:
         """Identify and process annotations within class definitions."""
-        if self.class_trace and self._is_relevant_model():
+        class_node = self.class_trace.popleft()
+        self.class_trace.appendleft(class_node)
+        if self.class_trace and self._is_relevant_model(class_node):
             annotation_node = node.annotation.annotation
 
             # If the annotation is a cst.Subscript, which is
@@ -811,7 +868,7 @@ def root_finders(
     xsd_models: XsdModels = "dataclass",
     directory_walk: bool = False,
     ignore_init_files: bool = True,
-    multiprocessing: MultiprocessingSettings = MultiprocessingSettings(),
+    multiprocessing: Optional[MultiprocessingSettings] = None,
 ) -> Optional[List[RootModel]]:
     """
     Identify and return root models from multiple Python source files.
@@ -835,8 +892,8 @@ def root_finders(
             `source` argument.
         ignore_init_files (bool): If `True`, ignores Python `__init__.py` files
             during the root-finding process.
-        multiprocessing (`MultiprocessingSettings`): Settings to enable and
-            configure multiprocessing.
+        multiprocessing (`MultiprocessingSettings` | None): Settings to enable and
+            configure multiprocessing. Defaults to None.
 
     Returns:
         Optional[List[`RootModel`]]: A list of `RootModel` instances representing
@@ -858,7 +915,7 @@ def root_finders(
         source = [Path(source)]
 
     # Apply multiprocessing if enabled by user
-    if multiprocessing.enabled:
+    if multiprocessing is not None:
         with ThreadPoolExecutor(multiprocessing.max_workers) as thread_executor:
             futures = {
                 thread_executor.submit(

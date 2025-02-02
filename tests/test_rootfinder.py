@@ -4,7 +4,14 @@ from typing import List, Optional
 
 import pytest
 
-from xsdata_rootfinder import RootModel, StrOrPath, XsdModels, root_finder, root_finders
+from xsdata_rootfinder import (
+    RootModel,
+    StrOrPath,
+    XsdModels,
+    root_finder,
+    root_finders,
+    MultiprocessingSettings,
+)
 
 # Constants and global variables used when testing
 ROOT_FINDER_PATH = Path("./tests/examples/root_finder/").resolve()
@@ -180,5 +187,12 @@ def test_root_finder_by_path(test_case: RootFinderTestCase) -> None:
 )
 def test_root_finders(test_case: RootFinderTestCase) -> None:
     """Test function for the `root_finders` function."""
+    # Test with multiprocessing disabled
     root_models = root_finders(test_case.path, test_case.xsd_model)
+    assert test_case.root_models == root_models
+
+    # Test with multiprocessing enabled
+    root_models = root_finders(
+        test_case.path, test_case.xsd_model, multiprocessing=MultiprocessingSettings()
+    )
     assert test_case.root_models == root_models
