@@ -27,9 +27,9 @@ from typing import (
     cast,
 )
 
-IS_PY_3_10 = sys.version_info >= (3, 10)
+_IS_PY_3_10 = sys.version_info >= (3, 10)
 
-if IS_PY_3_10:
+if _IS_PY_3_10:
     from typing import TypeAlias
 else:
     from typing_extensions import TypeAlias
@@ -47,13 +47,13 @@ XsdModels: TypeAlias = Literal["dataclass", "pydantic", "attrs"]
 
 
 def _normalize_path(path: str) -> str:
-    """"""
+    """Normalize a file system path by resolving case and double slashes."""
     return os.path.normcase(os.path.normpath(path))
 
 
 # Constants and global variables
-STDLIB_PATH = _normalize_path(sysconfig.get_paths()["stdlib"])
-THIRDPTYLIB_PATHS: Set[str] = {
+_STDLIB_PATH = _normalize_path(sysconfig.get_paths()["stdlib"])
+_THIRDPTYLIB_PATHS: Set[str] = {
     _normalize_path(sysconfig.get_paths()[path]) for path in ("purelib", "platlib")
 }
 _MAX_RETRIES = 3
@@ -184,18 +184,21 @@ def _decompose_module(module: str) -> List[str]:
 
 
 def _is_xsdata_import(module: _ImportIdentifier) -> bool:
-    """"""
+    """Check if the module belongs to the 'xsdata' library namespace."""
     return module.module.startswith("xsdata")
 
 
 def _is_builtin_type(annotation: str) -> bool:
-    """"""
+    """Determine if the given annotation is a Python primitive type."""
     return annotation in _PRIMITIVE_TYPES
 
 
 @lru_cache(maxsize=None)
-def _find_import_spec(module: _ImportIdentifier) -> PythonModuleSpec:
-    """"""
+def _find_import_spec(module: _ImportIdentifier) -> _PythonModuleSpec:
+    """
+    Locate and return the import specification for a module, identifying
+    whether it is standard library or third-party.
+    """
     module_parts = module.parts
     name = module_parts[0]
     package = (
@@ -208,15 +211,20 @@ def _find_import_spec(module: _ImportIdentifier) -> PythonModuleSpec:
 
     if spec is not None and spec.origin is not None:
         origin_path = _normalize_path(spec.origin)
-        is_third_party = any(origin_path.startswith(path) for path in THIRDPTYLIB_PATHS)
-        is_stdlib_path = origin_path.startswith(STDLIB_PATH)
+        is_third_party = any(
+            origin_path.startswith(path) for path in _THIRDPTYLIB_PATHS
+        )
+        is_stdlib_path = origin_path.startswith(_STDLIB_PATH)
         is_stdlib = is_stdlib_path and not is_third_party
-    return PythonModuleSpec(module, is_third_party, is_stdlib)
+    return _PythonModuleSpec(module, is_third_party, is_stdlib)
 
 
 @lru_cache(maxsize=None)
 def _get_module_defined_classes(path: Path) -> Set[str]:
-    """"""
+    """
+    Retrieve the set of class names defined in a Python module at the
+    given path.
+    """
     if not path.exists():
         return set()
 
@@ -276,8 +284,11 @@ class XSDataRootFinderError(Exception):
 
 
 @dataclass(frozen=True)
-class PythonModuleSpec:
-    """"""
+class _PythonModuleSpec:
+    """
+    Represents metadata about a Python module, including its import
+    classification.
+    """
 
     identifier: _ImportIdentifier
     third_party_import: bool
@@ -285,13 +296,19 @@ class PythonModuleSpec:
 
     @property
     def irrelevant_module(self) -> bool:
-        """"""
+        """
+        Check if the module is irrelevant by being either part of the standard
+        library or the 'xsdata' library.
+        """
         return self.stdlib_import or _is_xsdata_import(self.identifier)
 
     @property
     def is_python_library(self) -> bool:
-        """"""
-        return self.third_party_import or self.stdlib_import
+        """
+        Determine if the module is a Python library, either third-party or
+        otherwise classified as irrelevant.
+        """
+        return self.third_party_import or self.irrelevant_module
 
 
 @dataclass
@@ -321,7 +338,6 @@ class _XSDataCollectedClasses:
 
     def visit_and_consolidate_by_path(self, source: StrOrPath) -> None:
         """Process and consolidate data from a source file as a `StrOrPath` object."""
-        print(source)
         if not Path(source).is_file():
             raise FileNotFoundError(
                 "Every object in 'source' argument must must link to an existing file"
@@ -486,7 +502,10 @@ class _ReferencedClass:
 
 @dataclass
 class _LocalImportSearch:
-    """"""
+    """
+    Stores the result of a local import search, including the referenced
+    class and its library classification.
+    """
 
     referenced_class: Optional[_ReferencedClass] = None
     is_python_library: bool = False
@@ -689,6 +708,12 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
                 _decompose_module(star) + identifier.parts
             )
             import_spec = _find_import_spec(star_module)
+            if (
+                import_spec.is_python_library
+                and not local_import_search.is_python_library
+            ):
+                local_import_search.is_python_library = True
+
             if import_spec.irrelevant_module:
                 continue
 
@@ -698,12 +723,6 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
                     star_path, star_module.value
                 )
                 break
-
-            if (
-                import_spec.is_python_library
-                and not local_import_search.is_python_library
-            ):
-                local_import_search.is_python_library = True
         return local_import_search
 
     def _get_inherited_local_classes(self, node: cst.ClassDef) -> None:
