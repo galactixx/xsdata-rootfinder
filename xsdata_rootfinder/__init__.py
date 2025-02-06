@@ -8,15 +8,18 @@ import sysconfig
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Collection
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Semaphore
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from dataclasses import dataclass, field
 from functools import lru_cache
 from os import PathLike
 from pathlib import Path
 from typing import (
+    Any,
     ClassVar,
     Deque,
     Dict,
+    Generator,
     List,
     Literal,
     Optional,
@@ -56,7 +59,6 @@ _STDLIB_PATH = _normalize_path(sysconfig.get_paths()["stdlib"])
 _THIRDPTYLIB_PATHS: Set[str] = {
     _normalize_path(sysconfig.get_paths()[path]) for path in ("purelib", "platlib")
 }
-_MAX_RETRIES = 3
 _PRIMITIVE_TYPES = {
     "int",
     "str",
@@ -257,32 +259,6 @@ def _parse_import_alias(import_alias: cst.ImportAlias) -> Tuple[str, _ImportIden
     return alias, module
 
 
-class XSDataRootFinderError(Exception):
-    """
-    Custom exception for errors encountered during the XSData root-finding
-    process.
-
-    This exception is raised when the process of identifying root models in
-    Python source files fails due to issues such as file processing errors,
-    timeouts, or unexpected conditions.
-
-    Attributes:
-        message (str): A detailed message describing the error.
-        source (Path): The file path associated with the error, providing
-            context about where the error occurred.
-    """
-
-    def __init__(self, message: str, source: Path) -> None:
-        self.message = message
-        self.source = source
-
-    def __str__(self) -> str:
-        return repr(self)
-
-    def __repr__(self) -> str:
-        return self.message
-
-
 @dataclass(frozen=True)
 class _PythonModuleSpec:
     """
@@ -336,13 +312,13 @@ class _XSDataCollectedClasses:
         visitor = _python_source_visit(source, self.xsd_models)
         self._consoildate_classes(visitor)
 
-    def visit_and_consolidate_by_path(self, source: StrOrPath) -> None:
+    def visit_and_consolidate_by_path(self, source: Path) -> None:
         """Process and consolidate data from a source file as a `StrOrPath` object."""
+        print(source)
         if not Path(source).is_file():
             raise FileNotFoundError(
                 "Every object in 'source' argument must must link to an existing file"
             )
-
         self.visit_and_consolidate(source)
 
 
@@ -530,6 +506,7 @@ class MultiprocessingSettings:
 
     max_workers: Optional[int] = None
     timeout: Optional[int] = None
+    path_batch: int = 50
 
 
 class _XSDataClassDefFinderVisitor(cst.CSTVisitor):
@@ -819,6 +796,124 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
         return _root_finder(defs=self.defined_classes, refs=self.ref_classes)
 
 
+class _PendingPathsList(List[Future[None]]):
+    """"""
+
+    def __init__(
+        self,
+        paths: Generator[Path, None, None],
+        thread: ThreadPoolExecutor,
+        collected: _XSDataCollectedClasses,
+        multiprocessing: MultiprocessingSettings,
+        task_semaphore: Semaphore,
+    ) -> None:
+        super().__init__()
+        self._paths = paths
+        self._thread = thread
+        self._collected = collected
+        self._multiprocessing = multiprocessing
+        self._task_semaphore = task_semaphore
+
+    def remove_future(self, future: Future[None]) -> None:
+        """"""
+        self.remove(future)
+        future.result(timeout=self._multiprocessing.timeout)
+        self._task_semaphore.release()
+        self.add_future()
+
+    def add_future(self) -> None:
+        """"""
+        try:
+            path = next(self._paths)
+            future = self._thread.submit(
+                self._collected.visit_and_consolidate_by_path, path
+            )
+            self._task_semaphore.acquire()
+            self.append(future)
+        except StopIteration:
+            pass
+
+
+class _AbstractPathResolver(ABC):
+    """"""
+
+    def __init__(self, directory_walk: bool, ignore_init: bool) -> None:
+        self.directory_walk = directory_walk
+        self.ignore_init = ignore_init
+
+    @abstractmethod
+    def get_python_files(self) -> Generator[Path, None, None]:
+        """"""
+        pass
+
+    def _is_init_file(self, path: Path) -> bool:
+        """"""
+        return self.ignore_init and path.name == "__init__.py"
+
+    def _find_directory_files(self, path: Path) -> Generator[Path, None, None]:
+        """"""
+        directory_files = (
+            path.rglob("*.py") if self.directory_walk else path.glob("*.py")
+        )
+        for file in directory_files:
+            if not self._is_init_file(file):
+                yield file
+
+
+class _CollectionPathResolver(_AbstractPathResolver):
+    """"""
+
+    def __init__(
+        self, sources: Collection[StrOrPath], *args: Any, **kwargs: Any
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.sources = sources
+
+    def get_python_files(self) -> Generator[Path, None, None]:
+        """"""
+        for source in self.sources:
+            source_path = Path(source)
+            if not source_path.exists():
+                raise FileNotFoundError(
+                    "If path is passed in as the source, it must link to an existing file"
+                )
+
+            if source_path.is_dir():
+                source_nested_files = self._find_directory_files(source_path)
+                for nested_file in source_nested_files:
+                    yield nested_file
+            elif not self._is_init_file(source_path):
+                yield source_path
+
+
+class _DirectoryPathResolver(_AbstractPathResolver):
+    """"""
+
+    def __init__(self, source: StrOrPath, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.source = source
+
+    def get_python_files(self) -> Generator[Path, None, None]:
+        """"""
+        for nested_file in self._find_directory_files(Path(self.source)):
+            yield nested_file
+
+
+def _resolve_python_file_paths(
+    sources: Union[StrOrPath, Collection[StrOrPath]],
+    directory_walk: bool,
+    ignore_init_files: bool,
+) -> Generator[Path, None, None]:
+    """"""
+    resolver: _AbstractPathResolver
+    common_args = (directory_walk, ignore_init_files)
+    if isinstance(sources, Collection):
+        resolver = _CollectionPathResolver(sources, *common_args)
+    else:
+        resolver = _DirectoryPathResolver(sources, *common_args)
+    return resolver.get_python_files()
+
+
 def _read_python_file(source: CodeOrStrOrPath) -> str:
     """
     Reads and returns the content of a Python file or validate input
@@ -883,7 +978,7 @@ def root_finder(
 
 
 def root_finders(
-    source: Union[StrOrPath, Collection[StrOrPath]],
+    sources: Union[StrOrPath, Collection[StrOrPath]],
     xsd_models: XsdModels = "dataclass",
     directory_walk: bool = False,
     ignore_init_files: bool = True,
@@ -899,8 +994,8 @@ def root_finders(
     supports optional multiprocessing for parallel processing of files.
 
     Args:
-        source (`StrOrPath` | Collection[`StrOrPath`]): The source(s) to
-            analyze. This can be a single path-like object (file or directory),
+        sources (`StrOrPath` | Collection[`StrOrPath`]): The source(s) to
+            analyze. This can be a single directory as a path-like object,
             a collection of path-like objects representing multiple files. If a
             directory is provided, its Python files will be included for analysis.
         xsd_models (`XsdModels`): Specifies the type of models to look for. Can
@@ -919,49 +1014,27 @@ def root_finders(
             unreferenced class definitions across all files, or `None` if no root
             models are found.
     """
-
-    def is_init_file(path: StrOrPath) -> bool:
-        return ignore_init_files and Path(path).name == "__init__.py"
-
     consolidated_classes = _XSDataCollectedClasses(xsd_models)
 
     # Normalize sources into a list of file paths
-    if isinstance(source, (str, PathLike)) and Path(source).is_dir():
-        source = list(
-            Path(source).rglob("*.py") if directory_walk else Path(source).glob("*.py")
-        )
-    elif isinstance(source, (str, PathLike)):
-        source = [Path(source)]
-
-    # Apply multiprocessing if enabled by user
-    if multiprocessing is not None:
-        with ThreadPoolExecutor(multiprocessing.max_workers) as thread_executor:
-            futures = {
-                thread_executor.submit(
-                    consolidated_classes.visit_and_consolidate_by_path, path
-                ): path
-                for path in source
-                if not is_init_file(path)
-            }
-            for future in as_completed(futures):
-                fut_source = futures[future]
-                retry_counter = 0
-                while True:
-                    try:
-                        future.result(timeout=multiprocessing.timeout)
-                        break
-                    except TimeoutError as e:
-                        retry_counter += 1
-                        if retry_counter > _MAX_RETRIES:
-                            raise TimeoutError(e)
-                    except Exception as e:
-                        raise XSDataRootFinderError(
-                            "Task was not completed succesfully", Path(fut_source)
-                        ) from e
-    # Otherwise, default to iteration of sources
+    paths = _resolve_python_file_paths(sources, directory_walk, ignore_init_files)
+    if multiprocessing is None:
+        for path in paths:
+            consolidated_classes.visit_and_consolidate_by_path(path)
     else:
-        for path in source:
-            if not is_init_file(path):
-                consolidated_classes.visit_and_consolidate_by_path(path)
+        task_semaphore = Semaphore(multiprocessing.path_batch)
+        with ThreadPoolExecutor(multiprocessing.max_workers) as thread_executor:
+            pending_tasks = _PendingPathsList(
+                paths,
+                thread_executor,
+                consolidated_classes,
+                multiprocessing,
+                task_semaphore,
+            )
+            for _ in range(multiprocessing.path_batch):
+                pending_tasks.add_future()
 
+            while pending_tasks:
+                for future in as_completed(pending_tasks[:]):
+                    pending_tasks.remove_future(future)
     return consolidated_classes.root_finder()
