@@ -314,8 +314,7 @@ class _XSDataCollectedClasses:
 
     def visit_and_consolidate_by_path(self, source: Path) -> None:
         """Process and consolidate data from a source file as a `StrOrPath` object."""
-        print(source)
-        if not Path(source).is_file():
+        if not source.is_file():
             raise FileNotFoundError(
                 "Every object in 'source' argument must must link to an existing file"
             )
@@ -797,7 +796,11 @@ class _XSDataRootFinderVisitor(cst.CSTVisitor):
 
 
 class _PendingPathsList(List[Future[None]]):
-    """"""
+    """
+    A specialized list of pending Future tasks that manages concurrent
+    processing by auto-replenishing tasks from a generator using a
+    semaphore.
+    """
 
     def __init__(
         self,
@@ -815,14 +818,20 @@ class _PendingPathsList(List[Future[None]]):
         self._task_semaphore = task_semaphore
 
     def remove_future(self, future: Future[None]) -> None:
-        """"""
+        """
+        Removes a completed future, waits for its result with a timeout,
+        releases the semaphore slot, and submits a new task.
+        """
         self.remove(future)
         future.result(timeout=self._multiprocessing.timeout)
         self._task_semaphore.release()
         self.add_future()
 
     def add_future(self) -> None:
-        """"""
+        """
+        Submits a new task from the path generator, acquires the semaphore,
+        and appends the resulting future to the list.
+        """
         try:
             path = next(self._paths)
             future = self._thread.submit(
@@ -835,7 +844,10 @@ class _PendingPathsList(List[Future[None]]):
 
 
 class _AbstractPathResolver(ABC):
-    """"""
+    """
+    Abstract base class for resolving Python file paths with options for
+    recursive directory walk and ignoring __init__.py files.
+    """
 
     def __init__(self, directory_walk: bool, ignore_init: bool) -> None:
         self.directory_walk = directory_walk
@@ -843,15 +855,24 @@ class _AbstractPathResolver(ABC):
 
     @abstractmethod
     def get_python_files(self) -> Generator[Path, None, None]:
-        """"""
+        """
+        Returns a generator that yields Python file paths based on the
+        resolver's configuration.
+        """
         pass
 
     def _is_init_file(self, path: Path) -> bool:
-        """"""
+        """
+        Determines if the given path represents an __init__.py file when
+        ignoring such files is enabled.
+        """
         return self.ignore_init and path.name == "__init__.py"
 
     def _find_directory_files(self, path: Path) -> Generator[Path, None, None]:
-        """"""
+        """
+        Yields Python file paths from a directory, using recursive search
+        if enabled and excluding __init__.py files if configured.
+        """
         directory_files = (
             path.rglob("*.py") if self.directory_walk else path.glob("*.py")
         )
@@ -861,7 +882,10 @@ class _AbstractPathResolver(ABC):
 
 
 class _CollectionPathResolver(_AbstractPathResolver):
-    """"""
+    """
+    Concrete resolver that processes a collection of source paths and yields
+    Python file paths.
+    """
 
     def __init__(
         self, sources: Collection[StrOrPath], *args: Any, **kwargs: Any
@@ -870,7 +894,10 @@ class _CollectionPathResolver(_AbstractPathResolver):
         self.sources = sources
 
     def get_python_files(self) -> Generator[Path, None, None]:
-        """"""
+        """
+        Yields Python file paths from each source in the collection, processing
+        directories recursively and filtering out __init__.py files.
+        """
         for source in self.sources:
             source_path = Path(source)
             if not source_path.exists():
@@ -887,14 +914,20 @@ class _CollectionPathResolver(_AbstractPathResolver):
 
 
 class _DirectoryPathResolver(_AbstractPathResolver):
-    """"""
+    """
+    Concrete resolver that processes a single directory source to yield Python
+    file paths.
+    """
 
     def __init__(self, source: StrOrPath, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.source = source
 
     def get_python_files(self) -> Generator[Path, None, None]:
-        """"""
+        """
+        Yields Python file paths from the specified directory by iterating over
+        the files found by the base resolver's method.
+        """
         for nested_file in self._find_directory_files(Path(self.source)):
             yield nested_file
 
@@ -904,7 +937,11 @@ def _resolve_python_file_paths(
     directory_walk: bool,
     ignore_init_files: bool,
 ) -> Generator[Path, None, None]:
-    """"""
+    """
+    Resolves and yields Python file paths from the provided source(s) using
+    the appropriate resolver based on whether sources is a single path or a
+    collection.
+    """
     resolver: _AbstractPathResolver
     common_args = (directory_walk, ignore_init_files)
     if isinstance(sources, Collection):
@@ -963,15 +1000,15 @@ def root_finder(
 
     Args:
         source (`CodeOrStrOrPath`): The Python source to analyze. This can be
-            a string representing the code content or path, or a path-like object
-            pointing to a Python file.
+            a string representing the code content or path, or a path-like
+            object pointing to a Python file.
         xsd_models (`XsdModels`): Specifies the type of models to look for.
             Can be one of `'dataclass'` (default), `'pydantic'`, or `'attrs'`.
 
     Returns:
-        Optional[List[`RootModel`]]: A list of `RootModel` instances representing
-            unreferenced class definitions in the file, or `None` if no root
-            models are found.
+        Optional[List[`RootModel`]]: A list of `RootModel` instances
+            representing unreferenced class definitions in the file, or `None`
+            if no root models are found.
     """
     visitor = _python_source_visit(source, xsd_models)
     return visitor.root_finder()
@@ -996,18 +1033,19 @@ def root_finders(
     Args:
         sources (`StrOrPath` | Collection[`StrOrPath`]): The source(s) to
             analyze. This can be a single directory as a path-like object,
-            a collection of path-like objects representing multiple files. If a
-            directory is provided, its Python files will be included for analysis.
+            a collection of path-like objects representing multiple files or
+            directories. If a directory is provided, its Python files will
+            be included for analysis.
         xsd_models (`XsdModels`): Specifies the type of models to look for. Can
             be one of `'dataclass'` (default), `'pydantic'`, or `'attrs'`.
         directory_walk (bool): If `True`, recursively searches for Python files
-            within a directory. If `False`, only searches the immediate directory
-            for Python files. Only applicable if a directory is passed as the
-            `source` argument.
+            within any directory encountered. If `False`, only searches the
+            immediate directory for Python files. Only applicable if a
+            directory is passed as the `sources` argument.
         ignore_init_files (bool): If `True`, ignores Python `__init__.py` files
             during the root-finding process.
-        multiprocessing (`MultiprocessingSettings` | None): Settings to enable and
-            configure multiprocessing. Defaults to None.
+        multiprocessing (`MultiprocessingSettings` | None): Settings to enable
+            and configure multiprocessing. Defaults to None.
 
     Returns:
         Optional[List[`RootModel`]]: A list of `RootModel` instances representing
