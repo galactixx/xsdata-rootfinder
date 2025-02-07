@@ -497,15 +497,17 @@ class MultiprocessingSettings:
 
     Attributes:
         max_workers (int | None): The maximum number of workers (threads)
-            to use for multiprocessing. If `None`, the default thread pool size
-            is used.
-        timeout (int | None): The timeout (in seconds) for each task. If `None`,
-            no timeout is applied.
+            to use for multiprocessing. If `None`, the default thread pool
+            size is used.
+        timeout (int | None): The timeout (in seconds) for each task. If
+            `None`, no timeout is applied.
+        task_batch (int): An integer representing the maximum number of
+            concurrent tasks allowed. Defaults to 50.
     """
 
     max_workers: Optional[int] = None
     timeout: Optional[int] = None
-    path_batch: int = 50
+    task_batch: int = 50
 
 
 class _XSDataClassDefFinderVisitor(cst.CSTVisitor):
@@ -1060,7 +1062,7 @@ def root_finders(
         for path in paths:
             consolidated_classes.visit_and_consolidate_by_path(path)
     else:
-        task_semaphore = Semaphore(multiprocessing.path_batch)
+        task_semaphore = Semaphore(multiprocessing.task_batch)
         with ThreadPoolExecutor(multiprocessing.max_workers) as thread_executor:
             pending_tasks = _PendingPathsList(
                 paths,
@@ -1069,7 +1071,7 @@ def root_finders(
                 multiprocessing,
                 task_semaphore,
             )
-            for _ in range(multiprocessing.path_batch):
+            for _ in range(multiprocessing.task_batch):
                 pending_tasks.add_future()
 
             while pending_tasks:
