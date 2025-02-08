@@ -1,5 +1,10 @@
 # xsdata-rootfinder
 
+![Tests](https://github.com/galactixx/xsdata-rootfinder/actions/workflows/continuous_integration.yaml/badge.svg)
+[![PyPI version](https://img.shields.io/pypi/v/xsdata-rootfinder.svg)](https://pypi.org/project/xsdata-rootfinder/)
+[![Python versions](https://img.shields.io/pypi/pyversions/xsdata-rootfinder.svg)](https://pypi.org/project/xsdata-rootfinder/)
+[![License](https://img.shields.io/github/license/galactixx/xsdata-rootfinder.svg)](https://github.com/galactixx/xsdata-rootfinder/blob/main/LICENSE)
+
 A Python package designed to analyze Python source files and identify root models. This package supports different model types, including dataclass, Pydantic, and attrs, making it easy to work with various schema formats.
 
 ## Features
