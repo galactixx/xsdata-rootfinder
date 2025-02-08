@@ -44,8 +44,8 @@ from pathvalidate import ValidationError, validate_filepath
 # Typealiases
 _ModuleType: TypeAlias = Union[cst.Name, cst.Attribute]
 
-StrOrPath: TypeAlias = Union[str, PathLike[str]]
-CodeOrStrOrPath: TypeAlias = Union[str, PathLike[str]]
+StrOrPath: TypeAlias = Union[PathLike[str], Path]
+CodeOrStrOrPath: TypeAlias = Union[str, StrOrPath]
 XsdModels: TypeAlias = Literal["dataclass", "pydantic", "attrs"]
 
 
